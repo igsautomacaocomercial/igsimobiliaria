@@ -1,0 +1,10 @@
+Regra de negocio:
+Ao cadastrar um imovel, o valor de aluguel fica salvo em `imoveis.valor_aluguel`.
+Ao criar ou editar um contrato de locacao, o campo `valor_aluguel` deve ser preenchido a partir do imovel selecionado quando estiver vazio.
+
+Decisoes recentes:
+- Sempre manter tabelas grandes paginadas no frontend para evitar telas muito longas. Tamanho atual: 15 registros por pagina.
+- Relatorios devem ter exportacao CSV usando os dados ja carregados na tela.
+- Imoveis agora possuem checklist de qualidade calculado no frontend: proprietario, titulo, tipo, finalidade, status, endereco, bairro, cidade, valor comercial e local das chaves.
+- Dashboard deve priorizar saude da carteira, auditoria de cadastros e atalhos para correcao operacional.
+- Repositorio remoto previsto: git@github.com:igsautomacaocomercial/igsimobiliaria.git. Nunca salvar tokens/PAT em arquivos, comandos ou URLs; usar SSH ou credencial segura do GitHub.
