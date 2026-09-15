@@ -227,6 +227,13 @@ ALTER TABLE pessoas
   ADD COLUMN IF NOT EXISTS cadastro_em DATE DEFAULT CURRENT_DATE,
   ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMPTZ DEFAULT now();
 
+ALTER TABLE usuarios
+  ADD COLUMN IF NOT EXISTS ultimo_login TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS trocar_senha_primeiro_acesso BOOLEAN NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMPTZ DEFAULT now();
+
+CREATE UNIQUE INDEX IF NOT EXISTS usuarios_email_lower_idx ON usuarios (lower(email));
+
 CREATE TABLE IF NOT EXISTS pessoa_fiadores (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   locatario_id UUID NOT NULL REFERENCES pessoas(id) ON DELETE CASCADE,
@@ -307,7 +314,10 @@ ALTER TABLE parcelas_aluguel
   ADD COLUMN IF NOT EXISTS repassado_em DATE,
   ADD COLUMN IF NOT EXISTS estornado_em DATE,
   ADD COLUMN IF NOT EXISTS documento_personalizado TEXT,
-  ADD COLUMN IF NOT EXISTS documento_personalizado_em TIMESTAMPTZ;
+  ADD COLUMN IF NOT EXISTS documento_personalizado_em TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS cancelado_em TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS cancelado_por UUID REFERENCES usuarios(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS motivo_cancelamento TEXT;
 
 CREATE TABLE IF NOT EXISTS pagamentos_parcela (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -319,6 +329,12 @@ CREATE TABLE IF NOT EXISTS pagamentos_parcela (
   usuario_id UUID REFERENCES usuarios(id) ON DELETE SET NULL,
   criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE pagamentos_parcela
+  ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ativo',
+  ADD COLUMN IF NOT EXISTS estornado_em TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS estornado_por UUID REFERENCES usuarios(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS motivo_estorno TEXT;
 
 CREATE TABLE IF NOT EXISTS emprestimos_chaves (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -332,3 +348,46 @@ CREATE TABLE IF NOT EXISTS emprestimos_chaves (
   observacoes TEXT,
   criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE logs_sistema
+  ADD COLUMN IF NOT EXISTS dados_anteriores JSONB,
+  ADD COLUMN IF NOT EXISTS dados_novos JSONB,
+  ADD COLUMN IF NOT EXISTS ip TEXT,
+  ADD COLUMN IF NOT EXISTS user_agent TEXT;
+
+ALTER TABLE contas_pagar
+  ADD COLUMN IF NOT EXISTS cancelado_em TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS cancelado_por UUID REFERENCES usuarios(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS motivo_cancelamento TEXT;
+
+ALTER TABLE contas_receber
+  ADD COLUMN IF NOT EXISTS cancelado_em TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS cancelado_por UUID REFERENCES usuarios(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS motivo_cancelamento TEXT;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'contratos_vencimento_dia_check') THEN
+    ALTER TABLE contratos_locacao ADD CONSTRAINT contratos_vencimento_dia_check CHECK (vencimento_dia BETWEEN 1 AND 31);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'contratos_dia_repasse_check') THEN
+    ALTER TABLE contratos_locacao ADD CONSTRAINT contratos_dia_repasse_check CHECK (dia_repasse IS NULL OR dia_repasse BETWEEN 1 AND 31);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'contratos_valores_check') THEN
+    ALTER TABLE contratos_locacao ADD CONSTRAINT contratos_valores_check CHECK (valor_aluguel >= 0 AND taxa_administracao >= 0 AND taxa_intermediacao >= 0);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'contratos_periodo_check') THEN
+    ALTER TABLE contratos_locacao ADD CONSTRAINT contratos_periodo_check CHECK (prazo_indeterminado OR fim >= inicio);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'imoveis_valores_check') THEN
+    ALTER TABLE imoveis ADD CONSTRAINT imoveis_valores_check CHECK (valor_aluguel >= 0 AND valor_venda >= 0 AND condominio >= 0 AND iptu >= 0);
+  END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS parcelas_status_vencimento_idx ON parcelas_aluguel (status, vencimento);
+CREATE INDEX IF NOT EXISTS contratos_status_fim_idx ON contratos_locacao (status, fim);
+CREATE INDEX IF NOT EXISTS imoveis_status_idx ON imoveis (status);
+CREATE INDEX IF NOT EXISTS imoveis_proprietario_idx ON imoveis (proprietario_id);
+CREATE INDEX IF NOT EXISTS leads_etapa_idx ON leads (etapa);
+CREATE INDEX IF NOT EXISTS emprestimos_chaves_devolvida_idx ON emprestimos_chaves (devolvida_em);
+CREATE INDEX IF NOT EXISTS logs_sistema_criado_idx ON logs_sistema (criado_em);

@@ -8,3 +8,8 @@ Decisoes recentes:
 - Imoveis agora possuem checklist de qualidade calculado no frontend: proprietario, titulo, tipo, finalidade, status, endereco, bairro, cidade, valor comercial e local das chaves.
 - Dashboard deve priorizar saude da carteira, auditoria de cadastros e atalhos para correcao operacional.
 - Repositorio remoto previsto: git@github.com:igsautomacaocomercial/igsimobiliaria.git. Nunca salvar tokens/PAT em arquivos, comandos ou URLs; usar SSH ou credencial segura do GitHub.
+- Fase de seguranca: em producao `SESSION_SECRET`, `DATABASE_URL`, `INITIAL_ADMIN_EMAIL` e `INITIAL_ADMIN_PASSWORD` sao obrigatorios; senha inicial 123 nao pode ser usada em producao.
+- Perfis padronizados em maiusculo: ADMIN, FINANCEIRO, CORRETOR, ATENDIMENTO, VISTORIADOR e CONSULTA.
+- Operacoes financeiras que gravam parcela/pagamento/log devem usar transacao PostgreSQL via `withTransaction`.
+- Estorno de pagamento nao pode deletar `pagamentos_parcela`; deve marcar como `status = estornado` com usuario/data/motivo.
+- E-mails devem ser salvos normalizados com trim/lowercase; CPF/CNPJ deve ser salvo apenas com numeros.

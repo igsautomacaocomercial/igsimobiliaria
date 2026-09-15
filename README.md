@@ -5,6 +5,8 @@ V1 funcional de um sistema imobiliario inspirado em ERP de locacao, CRM/site de 
 ## Modulos da V1
 
 - Login com usuario inicial `admin@igs.local` e senha `123`
+- Login com administrador inicial configurado por `INITIAL_ADMIN_EMAIL` e `INITIAL_ADMIN_PASSWORD`
+- Sessao persistente em PostgreSQL, perfis de acesso e troca obrigatoria de senha no primeiro acesso
 - Dashboard com imoveis, contratos vencendo, atrasos e financeiro
 - Indicadores de saude da carteira: ocupacao, imoveis sem proprietario, imoveis sem valor e chaves abertas
 - Pessoas: locador, locatario, fiador, corretor, fornecedor e comprador, com ficha completa, documentos, filiacao, referencias e conjuge
@@ -36,6 +38,19 @@ DATABASE_URL=postgres://usuario:senha@localhost:5432/igs_imob_pro
 ```
 
 O app cria as tabelas automaticamente ao iniciar. Caso o banco ainda nao exista, crie primeiro o database `igs_imob_pro` no seu PostgreSQL.
+
+## Seguranca e ambiente
+
+Em producao, configure obrigatoriamente:
+
+- `NODE_ENV=production`
+- `DATABASE_URL`
+- `SESSION_SECRET`
+- `INITIAL_ADMIN_EMAIL`
+- `INITIAL_ADMIN_PASSWORD` com pelo menos 8 caracteres
+- `TRUST_PROXY=true` quando estiver atras de Cloudflare, nginx ou proxy HTTPS
+
+O sistema nao inicia em producao com senha inicial vazia ou `123`.
 
 ## Banco PostgreSQL
 

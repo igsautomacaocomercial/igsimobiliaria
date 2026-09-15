@@ -8,6 +8,20 @@ const state = {
 
 const pageSize = 15;
 
+const rolePermissions = {
+  ADMIN: ['*'],
+  FINANCEIRO: ['dashboard', 'faturas', 'relatorios', 'contas_receber', 'contas_pagar', 'pessoas', 'imoveis', 'contratos'],
+  CORRETOR: ['dashboard', 'pessoas', 'imoveis', 'contratos', 'leads', 'relatorios'],
+  ATENDIMENTO: ['dashboard', 'pessoas', 'imoveis', 'leads', 'chaves', 'relatorios'],
+  VISTORIADOR: ['dashboard', 'imoveis', 'relatorios'],
+  CONSULTA: ['dashboard', 'pessoas', 'imoveis', 'contratos', 'faturas', 'relatorios', 'leads', 'chaves', 'contas_receber', 'contas_pagar'],
+};
+
+function canView(view) {
+  const permissions = rolePermissions[String(state.user?.perfil || 'CONSULTA').toUpperCase()] || rolePermissions.CONSULTA;
+  return permissions.includes('*') || permissions.includes(view);
+}
+
 let filterRenderTimer;
 
 function scheduleFilterRender(selector = '#filter-input') {
@@ -309,6 +323,21 @@ const modules = {
       ['observacoes', 'Observacoes', 'textarea'],
     ],
   },
+  usuarios: {
+    icon: 'US',
+    title: 'Usuarios',
+    subtitle: 'Controle de acesso administrativo, perfis e status dos usuarios.',
+    endpoint: '/api/usuarios',
+    columns: ['nome', 'email', 'perfil', 'ativo', 'ultimo_login'],
+    search: ['nome', 'email', 'perfil'],
+    fields: [
+      ['nome', 'Nome', 'text'],
+      ['email', 'E-mail', 'email'],
+      ['perfil', 'Perfil', 'select', ['ADMIN', 'FINANCEIRO', 'CORRETOR', 'ATENDIMENTO', 'VISTORIADOR', 'CONSULTA']],
+      ['ativo', 'Ativo', 'checkbox'],
+      ['senha', 'Senha inicial (obrigatoria ao criar)', 'password'],
+    ],
+  },
 };
 
 async function api(url, options = {}) {
@@ -337,9 +366,37 @@ function render() {
     document.querySelector('#login-form').addEventListener('submit', login);
     return;
   }
+  if (state.user.trocar_senha_primeiro_acesso) {
+    app.innerHTML = firstPasswordTemplate();
+    document.querySelector('#first-password-form').addEventListener('submit', changeOwnPassword);
+    document.querySelector('#logout-first-access').addEventListener('click', async () => {
+      await api('/api/auth/logout', { method: 'POST', body: '{}' });
+      state.user = null;
+      render();
+    });
+    return;
+  }
   app.innerHTML = shellTemplate();
   bindShell();
   renderView();
+}
+
+function firstPasswordTemplate() {
+  return `
+    <section class="login">
+      <form class="login-panel" id="first-password-form">
+        <div class="logo-mark">IGS</div>
+        <h1>Troque sua senha</h1>
+        <p>Por seguranca, defina uma senha com pelo menos 8 caracteres antes de continuar.</p>
+        <label>Senha atual <input name="senha_atual" type="password" required></label>
+        <label>Nova senha <input name="nova_senha" type="password" minlength="8" required></label>
+        <label>Confirmar nova senha <input name="confirmar_senha" type="password" minlength="8" required></label>
+        <button class="primary" type="submit">Salvar senha</button>
+        <button class="secondary" type="button" id="logout-first-access">Sair</button>
+        <div class="error" id="password-error"></div>
+      </form>
+    </section>
+  `;
 }
 
 function loginTemplate() {
@@ -370,7 +427,8 @@ function shellTemplate() {
     ['leads', 'CRM'],
     ['contas_receber', 'Receber'],
     ['contas_pagar', 'Pagar'],
-  ];
+    ['usuarios', 'Usuarios'],
+  ].filter(([id]) => canView(id));
   return `
     <section class="shell">
       <aside class="sidebar">
@@ -386,13 +444,13 @@ function shellTemplate() {
       </aside>
       <section class="workspace">
         <header class="quickbar">
-          <button data-view="pessoas">Pesquisar cliente</button>
-          <button data-view="imoveis">Pesquisar imovel</button>
-          <button data-view="contratos">Controle de contratos</button>
-          <button data-view="faturas">Faturas e repasses</button>
-          <button data-view="relatorios">Relatorios de locacao</button>
-          <button data-view="chaves">Controle de chaves</button>
-          <button data-view="leads">Funil CRM</button>
+          ${canView('pessoas') ? '<button data-view="pessoas">Pesquisar cliente</button>' : ''}
+          ${canView('imoveis') ? '<button data-view="imoveis">Pesquisar imovel</button>' : ''}
+          ${canView('contratos') ? '<button data-view="contratos">Controle de contratos</button>' : ''}
+          ${canView('faturas') ? '<button data-view="faturas">Faturas e repasses</button>' : ''}
+          ${canView('relatorios') ? '<button data-view="relatorios">Relatorios de locacao</button>' : ''}
+          ${canView('chaves') ? '<button data-view="chaves">Controle de chaves</button>' : ''}
+          ${canView('leads') ? '<button data-view="leads">Funil CRM</button>' : ''}
         </header>
         <section class="content" id="content"></section>
       </section>
@@ -427,7 +485,23 @@ async function login(event) {
   }
 }
 
+async function changeOwnPassword(event) {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  try {
+    const { user } = await api('/api/auth/password', {
+      method: 'PUT',
+      body: JSON.stringify(Object.fromEntries(form.entries())),
+    });
+    state.user = user;
+    await loadView('dashboard');
+  } catch (error) {
+    document.querySelector('#password-error').textContent = error.message;
+  }
+}
+
 async function loadView(view) {
+  if (!canView(view)) view = 'dashboard';
   state.view = view;
   if (view === 'dashboard') {
     state.data.dashboard = await api('/api/dashboard');
@@ -774,7 +848,7 @@ function tableRow(name, config, row) {
         <button class="secondary" data-edit="${row.id}">Editar</button>
         ${name === 'pessoas' && row.tipo === 'locatario' ? `<button class="secondary" data-guarantor="${row.id}">Fiador</button>` : ''}
         ${name === 'contratos' ? `<button class="secondary" data-parcelas="${row.id}">Gerar faturas</button><button class="secondary" data-clauses="${row.id}">Clausulas</button><button class="secondary" data-document="${row.id}">Documento</button><a class="mini-link" target="_blank" href="/api/contratos/${row.id}/documento">Contrato</a>` : ''}
-        <button class="danger" data-delete="${row.id}">Excluir</button>
+        ${name === 'usuarios' ? `<button class="secondary" data-reset-password="${row.id}">Redefinir senha</button><button class="secondary" data-toggle-user="${row.id}" data-active="${row.ativo ? 'false' : 'true'}">${row.ativo ? 'Desativar' : 'Ativar'}</button>` : `<button class="danger" data-delete="${row.id}">Excluir</button>`}
       </td>
     </tr>
   `;
@@ -824,6 +898,26 @@ function bindModule(name) {
   document.querySelectorAll('[data-guarantor]').forEach((button) => {
     button.addEventListener('click', () => openGuarantorForm(button.dataset.guarantor));
   });
+  document.querySelectorAll('[data-reset-password]').forEach((button) => {
+    button.addEventListener('click', () => resetUserPassword(button.dataset.resetPassword));
+  });
+  document.querySelectorAll('[data-toggle-user]').forEach((button) => {
+    button.addEventListener('click', () => toggleUserStatus(button.dataset.toggleUser, button.dataset.active === 'true'));
+  });
+}
+
+async function resetUserPassword(id) {
+  const senha = prompt('Informe a nova senha temporaria com pelo menos 8 caracteres:');
+  if (!senha) return;
+  await api(`/api/usuarios/${id}/reset-password`, { method: 'PUT', body: JSON.stringify({ senha }) });
+  state.data.usuarios = await api('/api/usuarios');
+  render();
+}
+
+async function toggleUserStatus(id, ativo) {
+  await api(`/api/usuarios/${id}/status`, { method: 'PUT', body: JSON.stringify({ ativo }) });
+  state.data.usuarios = await api('/api/usuarios');
+  render();
 }
 
 async function openContractDocumentForm(id) {

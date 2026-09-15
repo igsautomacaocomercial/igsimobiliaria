@@ -3,13 +3,26 @@ require('dotenv').config();
 const path = require('path');
 const express = require('express');
 const session = require('express-session');
+const pgSession = require('connect-pg-simple')(session);
 const helmet = require('helmet');
 const compression = require('compression');
 const bcrypt = require('bcryptjs');
-const { initDatabase, query, pool } = require('./db');
+const { initDatabase, query, pool, normalizeEmail } = require('./db');
+const { can, requirePermission, normalizeRole } = require('./middleware/permissions');
+const { withTransaction } = require('./utils/transaction');
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
+const isProduction = process.env.NODE_ENV === 'production';
+const sessionSecret = process.env.SESSION_SECRET || (isProduction ? null : 'igs-imob-pro-dev-secret');
+const trustProxy = process.env.TRUST_PROXY === 'true' || isProduction;
+const sessionMaxAgeHours = Number(process.env.SESSION_MAX_AGE_HOURS || 8);
+
+if (!sessionSecret) {
+  throw new Error('Configure SESSION_SECRET em producao.');
+}
+
+if (trustProxy) app.set('trust proxy', 1);
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(compression());
@@ -17,23 +30,35 @@ app.use(express.json({ limit: '2mb' }));
 app.use(
   session({
     name: 'igs.sid',
-    secret: process.env.SESSION_SECRET || 'igs-imob-pro-dev-secret',
+    store: new pgSession({
+      pool,
+      tableName: 'session',
+      createTableIfMissing: true,
+    }),
+    secret: sessionSecret,
     resave: false,
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
       sameSite: 'lax',
-      secure: false,
-      maxAge: 1000 * 60 * 60 * 8,
+      secure: isProduction,
+      maxAge: 1000 * 60 * 60 * sessionMaxAgeHours,
     },
   })
 );
+
+const loginAttempts = new Map();
+const maxLoginAttempts = Number(process.env.LOGIN_MAX_ATTEMPTS || 5);
+const loginBlockMinutes = Number(process.env.LOGIN_BLOCK_MINUTES || 15);
 
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 function requireAuth(req, res, next) {
   if (!req.session.user) {
     return res.status(401).json({ error: 'Sessao expirada. Faca login novamente.' });
+  }
+  if (req.session.user.trocar_senha_primeiro_acesso && req.path !== '/api/auth/password' && req.path !== '/api/auth/logout' && req.path !== '/api/auth/me') {
+    return res.status(403).json({ error: 'Troque sua senha para continuar.', trocar_senha_primeiro_acesso: true });
   }
   next();
 }
@@ -57,6 +82,61 @@ function normalizeEmpty(data) {
     if (data[key] === '') data[key] = null;
   }
   return data;
+}
+
+function normalizeCpfCnpj(value) {
+  return value ? String(value).replace(/\D/g, '') : value;
+}
+
+function normalizeRecord(data) {
+  if ('email' in data && data.email) data.email = normalizeEmail(data.email);
+  if ('cpf_cnpj' in data && data.cpf_cnpj) data.cpf_cnpj = normalizeCpfCnpj(data.cpf_cnpj);
+  if ('conjuge_cpf' in data && data.conjuge_cpf) data.conjuge_cpf = normalizeCpfCnpj(data.conjuge_cpf);
+  return data;
+}
+
+function getClientIp(req) {
+  return req.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || '';
+}
+
+function loginAttemptKey(req, email) {
+  return `${getClientIp(req)}:${normalizeEmail(email)}`;
+}
+
+function loginAttemptState(req, email) {
+  const key = loginAttemptKey(req, email);
+  const current = loginAttempts.get(key);
+  if (!current) return { key, blocked: false, attempts: 0 };
+  if (current.blockedUntil && current.blockedUntil > Date.now()) return { key, ...current, blocked: true };
+  if (current.blockedUntil && current.blockedUntil <= Date.now()) loginAttempts.delete(key);
+  return { key, blocked: false, attempts: current.attempts || 0 };
+}
+
+function registerFailedLogin(req, email) {
+  const state = loginAttemptState(req, email);
+  const attempts = state.attempts + 1;
+  const blockedUntil = attempts >= maxLoginAttempts ? Date.now() + loginBlockMinutes * 60 * 1000 : null;
+  loginAttempts.set(state.key, { attempts, blockedUntil });
+  return { attempts, blockedUntil };
+}
+
+function clearFailedLogin(req, email) {
+  loginAttempts.delete(loginAttemptKey(req, email));
+}
+
+function validatePassword(password) {
+  return typeof password === 'string' && password.length >= 8;
+}
+
+function sanitizeForLog(value) {
+  if (!value || typeof value !== 'object') return value;
+  const copy = Array.isArray(value) ? [...value] : { ...value };
+  for (const key of Object.keys(copy)) {
+    if (key.toLowerCase().includes('senha') || key.toLowerCase().includes('password') || key.toLowerCase().includes('hash')) {
+      copy[key] = '[redacted]';
+    }
+  }
+  return copy;
 }
 
 function addMonthsIso(dateValue, months) {
@@ -172,9 +252,9 @@ function brDate(value) {
   return new Date(value).toLocaleDateString('pt-BR', { timeZone: 'UTC' });
 }
 
-async function recordParcelPayment(req, parcelaId, valor, formaPagamento, pagoEm, observacao) {
+async function recordParcelPayment(req, parcelaId, valor, formaPagamento, pagoEm, observacao, db = { query }) {
   if (!Number.isFinite(Number(valor)) || Number(valor) <= 0) return;
-  await query(
+  await db.query(
     `INSERT INTO pagamentos_parcela (parcela_id, valor, forma_pagamento, pago_em, observacao, usuario_id)
      VALUES ($1, $2, $3, COALESCE($4::date, CURRENT_DATE), $5, $6)`,
     [parcelaId, valor, paymentMethod(formaPagamento), pagoEm || null, observacao || null, req.session.user?.id || null]
@@ -203,29 +283,63 @@ async function nextSequentialCode(resourceName) {
   return result.rows[0].codigo;
 }
 
-async function logAction(req, acao, entidade, entidadeId, detalhes = {}) {
+async function logAction(req, acao, entidade, entidadeId, detalhes = {}, options = {}) {
   if (!req.session.user) return;
+  const db = options.client || { query };
+  await db.query(
+    `INSERT INTO logs_sistema
+      (usuario_id, acao, entidade, entidade_id, detalhes, dados_anteriores, dados_novos, ip, user_agent)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    [
+      req.session.user.id,
+      acao,
+      entidade,
+      entidadeId || null,
+      sanitizeForLog(detalhes),
+      sanitizeForLog(options.before || null),
+      sanitizeForLog(options.after || null),
+      getClientIp(req),
+      req.get('user-agent') || null,
+    ]
+  );
+}
+
+async function logSecurityEvent(req, acao, detalhes = {}, userId = null) {
   await query(
-    'INSERT INTO logs_sistema (usuario_id, acao, entidade, entidade_id, detalhes) VALUES ($1, $2, $3, $4, $5)',
-    [req.session.user.id, acao, entidade, entidadeId || null, detalhes]
+    `INSERT INTO logs_sistema (usuario_id, acao, entidade, entidade_id, detalhes, ip, user_agent)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [userId, acao, 'auth', userId, sanitizeForLog(detalhes), getClientIp(req), req.get('user-agent') || null]
   );
 }
 
 app.post('/api/auth/login', async (req, res) => {
-  const { email, senha } = req.body;
-  const result = await query('SELECT * FROM usuarios WHERE email = $1 AND ativo = TRUE', [email]);
+  const email = normalizeEmail(req.body.email);
+  const { senha } = req.body;
+  const attempt = loginAttemptState(req, email);
+  if (attempt.blocked) {
+    await logSecurityEvent(req, 'login_bloqueado', { email });
+    return res.status(429).json({ error: 'Muitas tentativas invalidas. Tente novamente mais tarde.' });
+  }
+
+  const result = await query('SELECT * FROM usuarios WHERE lower(email) = $1 AND ativo = TRUE', [email]);
   const user = result.rows[0];
 
   if (!user || !(await bcrypt.compare(senha || '', user.senha_hash))) {
+    const failed = registerFailedLogin(req, email);
+    await logSecurityEvent(req, failed.blockedUntil ? 'usuario_bloqueado_temporariamente' : 'login_invalido', { email, attempts: failed.attempts }, user?.id || null);
     return res.status(401).json({ error: 'E-mail ou senha invalidos.' });
   }
+
+  clearFailedLogin(req, email);
 
   req.session.user = {
     id: user.id,
     nome: user.nome,
     email: user.email,
-    perfil: user.perfil,
+    perfil: normalizeRole(user.perfil),
+    trocar_senha_primeiro_acesso: user.trocar_senha_primeiro_acesso,
   };
+  await query('UPDATE usuarios SET ultimo_login = now() WHERE id = $1', [user.id]);
   await logAction(req, 'login', 'usuarios', user.id);
   res.json({ user: req.session.user });
 });
@@ -233,14 +347,114 @@ app.post('/api/auth/login', async (req, res) => {
 app.post('/api/auth/logout', requireAuth, async (req, res) => {
   const userId = req.session.user.id;
   await logAction(req, 'logout', 'usuarios', userId);
-  req.session.destroy(() => res.json({ ok: true }));
+  req.session.destroy((error) => {
+    if (error) return res.status(500).json({ error: 'Erro ao encerrar sessao.' });
+    res.clearCookie('igs.sid');
+    res.json({ ok: true });
+  });
 });
 
 app.get('/api/auth/me', (req, res) => {
   res.json({ user: req.session.user || null });
 });
 
-app.get('/api/dashboard', requireAuth, async (_req, res) => {
+app.put('/api/auth/password', requireAuth, async (req, res) => {
+  const { senha_atual, nova_senha, confirmar_senha } = req.body;
+  if (!validatePassword(nova_senha)) return res.status(400).json({ error: 'A nova senha deve ter pelo menos 8 caracteres.' });
+  if (nova_senha !== confirmar_senha) return res.status(400).json({ error: 'A confirmacao da senha nao confere.' });
+
+  const result = await query('SELECT senha_hash FROM usuarios WHERE id = $1 AND ativo = TRUE', [req.session.user.id]);
+  const user = result.rows[0];
+  if (!user || !(await bcrypt.compare(senha_atual || '', user.senha_hash))) {
+    await logAction(req, 'troca_senha_invalida', 'usuarios', req.session.user.id);
+    return res.status(400).json({ error: 'Senha atual invalida.' });
+  }
+
+  const hash = await bcrypt.hash(nova_senha, 10);
+  await query('UPDATE usuarios SET senha_hash = $1, trocar_senha_primeiro_acesso = FALSE, atualizado_em = now() WHERE id = $2', [hash, req.session.user.id]);
+  req.session.user.trocar_senha_primeiro_acesso = false;
+  await logAction(req, 'trocar_senha', 'usuarios', req.session.user.id);
+  res.json({ ok: true, user: req.session.user });
+});
+
+app.get('/api/usuarios', requireAuth, requirePermission('admin.write'), async (_req, res) => {
+  const result = await query(`
+    SELECT id, nome, email, perfil, ativo, criado_em, ultimo_login, trocar_senha_primeiro_acesso
+    FROM usuarios
+    ORDER BY nome ASC
+  `);
+  res.json(result.rows);
+});
+
+app.post('/api/usuarios', requireAuth, requirePermission('admin.write'), async (req, res) => {
+  const nome = String(req.body.nome || '').trim();
+  const email = normalizeEmail(req.body.email);
+  const perfil = normalizeRole(req.body.perfil);
+  const senha = req.body.senha || req.body.nova_senha;
+  if (!nome || !email) return res.status(400).json({ error: 'Informe nome e e-mail.' });
+  if (!validatePassword(senha)) return res.status(400).json({ error: 'A senha deve ter pelo menos 8 caracteres.' });
+  const hash = await bcrypt.hash(senha, 10);
+  try {
+    const result = await query(
+      `INSERT INTO usuarios (nome, email, senha_hash, perfil, ativo, trocar_senha_primeiro_acesso)
+       VALUES ($1, $2, $3, $4, TRUE, TRUE)
+       RETURNING id, nome, email, perfil, ativo, criado_em, ultimo_login, trocar_senha_primeiro_acesso`,
+      [nome, email, hash, perfil]
+    );
+    await logAction(req, 'criar_usuario', 'usuarios', result.rows[0].id, {}, { after: result.rows[0] });
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    res.status(400).json({ error: error.detail || 'Erro ao cadastrar usuario.' });
+  }
+});
+
+app.put('/api/usuarios/:id', requireAuth, requirePermission('admin.write'), async (req, res) => {
+  const previous = await query('SELECT id, nome, email, perfil, ativo, criado_em, ultimo_login, trocar_senha_primeiro_acesso FROM usuarios WHERE id = $1', [req.params.id]);
+  if (!previous.rows[0]) return res.status(404).json({ error: 'Usuario nao encontrado.' });
+  const nome = String(req.body.nome || '').trim();
+  const email = normalizeEmail(req.body.email);
+  const perfil = normalizeRole(req.body.perfil);
+  const ativo = checkbox(req.body.ativo);
+  if (!nome || !email) return res.status(400).json({ error: 'Informe nome e e-mail.' });
+  const result = await query(
+    `UPDATE usuarios
+     SET nome = $1, email = $2, perfil = $3, ativo = $4, atualizado_em = now()
+     WHERE id = $5
+     RETURNING id, nome, email, perfil, ativo, criado_em, ultimo_login, trocar_senha_primeiro_acesso`,
+    [nome, email, perfil, ativo, req.params.id]
+  );
+  await logAction(req, 'atualizar_usuario', 'usuarios', req.params.id, {}, { before: previous.rows[0], after: result.rows[0] });
+  res.json(result.rows[0]);
+});
+
+app.put('/api/usuarios/:id/status', requireAuth, requirePermission('admin.write'), async (req, res) => {
+  if (req.params.id === req.session.user.id && checkbox(req.body.ativo) === false) {
+    return res.status(400).json({ error: 'Voce nao pode desativar seu proprio usuario.' });
+  }
+  const previous = await query('SELECT id, nome, email, perfil, ativo FROM usuarios WHERE id = $1', [req.params.id]);
+  if (!previous.rows[0]) return res.status(404).json({ error: 'Usuario nao encontrado.' });
+  const result = await query(
+    'UPDATE usuarios SET ativo = $1, atualizado_em = now() WHERE id = $2 RETURNING id, nome, email, perfil, ativo, criado_em, ultimo_login, trocar_senha_primeiro_acesso',
+    [checkbox(req.body.ativo), req.params.id]
+  );
+  await logAction(req, result.rows[0].ativo ? 'ativar_usuario' : 'desativar_usuario', 'usuarios', req.params.id, {}, { before: previous.rows[0], after: result.rows[0] });
+  res.json(result.rows[0]);
+});
+
+app.put('/api/usuarios/:id/reset-password', requireAuth, requirePermission('admin.write'), async (req, res) => {
+  const senha = req.body.senha || req.body.nova_senha;
+  if (!validatePassword(senha)) return res.status(400).json({ error: 'A senha deve ter pelo menos 8 caracteres.' });
+  const hash = await bcrypt.hash(senha, 10);
+  const result = await query(
+    'UPDATE usuarios SET senha_hash = $1, trocar_senha_primeiro_acesso = TRUE, atualizado_em = now() WHERE id = $2 RETURNING id, nome, email, perfil, ativo, criado_em, ultimo_login, trocar_senha_primeiro_acesso',
+    [hash, req.params.id]
+  );
+  if (!result.rows[0]) return res.status(404).json({ error: 'Usuario nao encontrado.' });
+  await logAction(req, 'redefinir_senha_usuario', 'usuarios', req.params.id, {}, { after: result.rows[0] });
+  res.json(result.rows[0]);
+});
+
+app.get('/api/dashboard', requireAuth, requirePermission('dashboard.read'), async (_req, res) => {
   const [
     imoveis,
     contratosVencendo,
@@ -260,9 +474,9 @@ app.get('/api/dashboard', requireAuth, async (_req, res) => {
   ] = await Promise.all([
     query("SELECT status, COUNT(*)::int total FROM imoveis GROUP BY status"),
     query("SELECT COUNT(*)::int total FROM contratos_locacao WHERE status = 'ativo' AND fim BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '60 days'"),
-    query("SELECT COUNT(*)::int total, COALESCE(SUM(valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto - COALESCE(valor_pago,0)), 0)::numeric total_valor FROM parcelas_aluguel WHERE status <> 'paga' AND vencimento < CURRENT_DATE"),
-    query("SELECT COUNT(*)::int total, COALESCE(SUM(valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto - COALESCE(valor_pago,0)), 0)::numeric total_valor FROM parcelas_aluguel WHERE status <> 'paga' AND vencimento = CURRENT_DATE"),
-    query("SELECT COUNT(*)::int total, COALESCE(SUM(valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto - COALESCE(valor_pago,0)), 0)::numeric total_valor FROM parcelas_aluguel WHERE status <> 'paga' AND vencimento BETWEEN CURRENT_DATE + INTERVAL '1 day' AND CURRENT_DATE + INTERVAL '7 days'"),
+    query("SELECT COUNT(*)::int total, COALESCE(SUM(valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto - COALESCE(valor_pago,0)), 0)::numeric total_valor FROM parcelas_aluguel WHERE status NOT IN ('paga','cancelada') AND vencimento < CURRENT_DATE"),
+    query("SELECT COUNT(*)::int total, COALESCE(SUM(valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto - COALESCE(valor_pago,0)), 0)::numeric total_valor FROM parcelas_aluguel WHERE status NOT IN ('paga','cancelada') AND vencimento = CURRENT_DATE"),
+    query("SELECT COUNT(*)::int total, COALESCE(SUM(valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto - COALESCE(valor_pago,0)), 0)::numeric total_valor FROM parcelas_aluguel WHERE status NOT IN ('paga','cancelada') AND vencimento BETWEEN CURRENT_DATE + INTERVAL '1 day' AND CURRENT_DATE + INTERVAL '7 days'"),
     query("SELECT COUNT(*)::int total, COALESCE(SUM(valor), 0)::numeric total_valor FROM contas_pagar WHERE status <> 'paga'"),
     query("SELECT COUNT(*)::int total, COALESCE(SUM(valor), 0)::numeric total_valor FROM contas_pagar WHERE status <> 'paga' AND vencimento < CURRENT_DATE"),
     query("SELECT COUNT(*)::int total, COALESCE(SUM(valor), 0)::numeric total_valor FROM contas_receber WHERE status <> 'recebida'"),
@@ -299,7 +513,7 @@ app.get('/api/dashboard', requireAuth, async (_req, res) => {
         FROM parcelas_aluguel p
         JOIN contratos_locacao c ON c.id = p.contrato_id
         LEFT JOIN pessoas locatario ON locatario.id = c.locatario_id
-        WHERE p.status <> 'paga' AND p.vencimento <= CURRENT_DATE + INTERVAL '7 days'
+        WHERE p.status NOT IN ('paga','cancelada') AND p.vencimento <= CURRENT_DATE + INTERVAL '7 days'
         UNION ALL
         SELECT
           CASE
@@ -358,7 +572,7 @@ app.get('/api/dashboard', requireAuth, async (_req, res) => {
   });
 });
 
-app.get('/api/cep/:cep', requireAuth, async (req, res) => {
+app.get('/api/cep/:cep', requireAuth, requirePermission('cep.read'), async (req, res) => {
   const cep = String(req.params.cep || '').replace(/\D/g, '');
   if (cep.length !== 8) return res.status(400).json({ error: 'CEP invalido.' });
 
@@ -414,8 +628,24 @@ const resources = {
   },
 };
 
+const resourcePermissions = {
+  pessoas: 'pessoas',
+  imoveis: 'imoveis',
+  contratos: 'contratos',
+  contas_receber: 'contas_receber',
+  contas_pagar: 'contas_pagar',
+  leads: 'leads',
+  chaves: 'chaves',
+};
+
+function permissionForResource(name, action) {
+  const base = resourcePermissions[name] || name;
+  if (action === 'delete' && ['contratos', 'contas_receber', 'contas_pagar'].includes(name)) return 'admin.write';
+  return `${base}.${action === 'read' ? 'read' : 'write'}`;
+}
+
 for (const [name, config] of Object.entries(resources)) {
-  app.get(`/api/${name}`, requireAuth, async (_req, res) => {
+  app.get(`/api/${name}`, requireAuth, requirePermission(permissionForResource(name, 'read')), async (_req, res) => {
     const sql = name === 'pessoas'
       ? `SELECT p.*,
           COALESCE(string_agg(f.nome, ', ' ORDER BY f.nome) FILTER (WHERE f.id IS NOT NULL), '') fiadores_nomes
@@ -429,8 +659,8 @@ for (const [name, config] of Object.entries(resources)) {
     res.json(result.rows);
   });
 
-  app.post(`/api/${name}`, requireAuth, async (req, res) => {
-    const data = normalizeEmpty(pick(req.body, config.fields));
+  app.post(`/api/${name}`, requireAuth, requirePermission(permissionForResource(name, 'write')), async (req, res) => {
+    const data = normalizeRecord(normalizeEmpty(pick(req.body, config.fields)));
     if (codeConfig[name]) data.codigo = await nextSequentialCode(name);
     try {
       if (config.table === 'contratos_locacao') await fillContractRentFromProperty(data);
@@ -454,11 +684,9 @@ for (const [name, config] of Object.entries(resources)) {
     }
   });
 
-  app.put(`/api/${name}/:id`, requireAuth, async (req, res) => {
-    const data = normalizeEmpty(pick(req.body, config.fields));
-    const previous = config.table === 'contratos_locacao'
-      ? await query('SELECT imovel_id FROM contratos_locacao WHERE id = $1', [req.params.id])
-      : null;
+  app.put(`/api/${name}/:id`, requireAuth, requirePermission(permissionForResource(name, 'write')), async (req, res) => {
+    const data = normalizeRecord(normalizeEmpty(pick(req.body, config.fields)));
+    const previous = await query(`SELECT * FROM ${config.table} WHERE id = $1`, [req.params.id]);
     let result;
     try {
       if (config.table === 'contratos_locacao') await fillContractRentFromProperty(data);
@@ -487,14 +715,25 @@ for (const [name, config] of Object.entries(resources)) {
       if (oldImovelId && oldImovelId !== newImovelId) await syncImovelStatusFromContracts(oldImovelId);
     }
 
-    await logAction(req, 'atualizar', config.table, result.rows[0].id, result.rows[0]);
+    await logAction(req, 'atualizar', config.table, result.rows[0].id, {}, { before: previous?.rows?.[0], after: result.rows[0] });
     res.json(result.rows[0]);
   });
 
-  app.delete(`/api/${name}/:id`, requireAuth, async (req, res) => {
+  app.delete(`/api/${name}/:id`, requireAuth, requirePermission(permissionForResource(name, 'delete')), async (req, res) => {
     const previous = config.table === 'contratos_locacao'
       ? await query('SELECT imovel_id FROM contratos_locacao WHERE id = $1', [req.params.id])
       : null;
+    if (['contas_pagar', 'contas_receber'].includes(config.table)) {
+      const result = await query(
+        `UPDATE ${config.table}
+         SET status = $2, cancelado_em = now(), cancelado_por = $3, motivo_cancelamento = COALESCE($4, motivo_cancelamento)
+         WHERE id = $1 RETURNING id`,
+        [req.params.id, config.table === 'contas_receber' ? 'cancelada' : 'cancelada', req.session.user.id, req.body.motivo_cancelamento || null]
+      );
+      if (result.rowCount === 0) return res.status(404).json({ error: 'Registro nao encontrado.' });
+      await logAction(req, 'cancelar', config.table, req.params.id, { motivo: req.body.motivo_cancelamento || null });
+      return res.json({ ok: true });
+    }
     const result = await query(`DELETE FROM ${config.table} WHERE id = $1 RETURNING id`, [req.params.id]);
     if (result.rowCount === 0) return res.status(404).json({ error: 'Registro nao encontrado.' });
     if (config.table === 'contratos_locacao') await syncImovelStatusFromContracts(previous?.rows?.[0]?.imovel_id);
@@ -503,11 +742,11 @@ for (const [name, config] of Object.entries(resources)) {
   });
 }
 
-app.post('/api/pessoas/:id/fiadores', requireAuth, async (req, res) => {
+app.post('/api/pessoas/:id/fiadores', requireAuth, requirePermission('pessoas.write'), async (req, res) => {
   const locatario = await query('SELECT id, nome FROM pessoas WHERE id = $1', [req.params.id]);
   if (!locatario.rows[0]) return res.status(404).json({ error: 'Locatario nao encontrado.' });
 
-  const data = normalizeEmpty(pick({ ...req.body, tipo: 'fiador' }, resources.pessoas.fields));
+  const data = normalizeRecord(normalizeEmpty(pick({ ...req.body, tipo: 'fiador' }, resources.pessoas.fields)));
   data.tipo = 'fiador';
   data.codigo = await nextSequentialCode('pessoas');
   if (!data.nome) return res.status(400).json({ error: 'Informe o nome do fiador.' });
@@ -532,77 +771,82 @@ app.post('/api/pessoas/:id/fiadores', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/contratos/:id/gerar-parcelas', requireAuth, async (req, res) => {
-  const contratoResult = await query(`
-    SELECT c.*, COALESCE(i.iptu, 0) imovel_iptu, COALESCE(i.condominio, 0) imovel_condominio
-    FROM contratos_locacao c
-    LEFT JOIN imoveis i ON i.id = c.imovel_id
-    WHERE c.id = $1
-  `, [req.params.id]);
-  const contrato = contratoResult.rows[0];
-  if (!contrato) return res.status(404).json({ error: 'Contrato nao encontrado.' });
+app.post('/api/contratos/:id/gerar-parcelas', requireAuth, requirePermission('parcelas.write'), async (req, res) => {
+  const response = await withTransaction(async (client) => {
+    const contratoResult = await client.query(`
+      SELECT c.*, COALESCE(i.iptu, 0) imovel_iptu, COALESCE(i.condominio, 0) imovel_condominio
+      FROM contratos_locacao c
+      LEFT JOIN imoveis i ON i.id = c.imovel_id
+      WHERE c.id = $1
+      FOR UPDATE OF c
+    `, [req.params.id]);
+    const contrato = contratoResult.rows[0];
+    if (!contrato) return null;
 
-  const inserted = await query(
-    `
-      WITH meses AS (
-        SELECT generate_series(date_trunc('month', $1::date), date_trunc('month', $2::date), INTERVAL '1 month') competencia
-      )
-      INSERT INTO parcelas_aluguel (contrato_id, competencia, vencimento, repasse_vencimento, valor, valor_repasse, iptu_valor, condominio_valor, descricao, categoria, recibo_numero)
-      SELECT $3,
-        competencia::date,
-        (competencia + (($4::int - 1) * INTERVAL '1 day'))::date,
-        (competencia + (($6::int - 1) * INTERVAL '1 day'))::date,
-        $5,
-        GREATEST($5 - (($5 * COALESCE($7::numeric, 0)) / 100), 0),
-        CASE WHEN $8::boolean THEN COALESCE($9::numeric, 0) ELSE 0 END,
-        COALESCE($10::numeric, 0),
-        'Aluguel Periodo ' || to_char(competencia, 'DD/MM/YYYY') || ' a ' || to_char(competencia + INTERVAL '1 month' - INTERVAL '1 day', 'DD/MM/YYYY'),
-        'ALUGUEL',
-        nextval('recibo_numero_seq')
-      FROM meses
-      WHERE NOT EXISTS (
-        SELECT 1 FROM parcelas_aluguel p
-        WHERE p.contrato_id = $3 AND p.competencia = meses.competencia::date
-      )
-      RETURNING *
-    `,
-    [
-      contrato.inicio,
-      contrato.fim,
-      contrato.id,
-      contrato.vencimento_dia,
-      contrato.valor_aluguel,
-      contrato.dia_repasse || contrato.vencimento_dia,
-      contrato.taxa_administracao,
-      contrato.cobrar_iptu,
-      contrato.imovel_iptu,
-      contrato.imovel_condominio,
-    ]
-  );
+    const inserted = await client.query(
+      `
+        WITH meses AS (
+          SELECT generate_series(date_trunc('month', $1::date), date_trunc('month', $2::date), INTERVAL '1 month') competencia
+        )
+        INSERT INTO parcelas_aluguel (contrato_id, competencia, vencimento, repasse_vencimento, valor, valor_repasse, iptu_valor, condominio_valor, descricao, categoria, recibo_numero)
+        SELECT $3,
+          competencia::date,
+          (competencia + (($4::int - 1) * INTERVAL '1 day'))::date,
+          (competencia + (($6::int - 1) * INTERVAL '1 day'))::date,
+          $5,
+          GREATEST($5 - (($5 * COALESCE($7::numeric, 0)) / 100), 0),
+          CASE WHEN $8::boolean THEN COALESCE($9::numeric, 0) ELSE 0 END,
+          COALESCE($10::numeric, 0),
+          'Aluguel Periodo ' || to_char(competencia, 'DD/MM/YYYY') || ' a ' || to_char(competencia + INTERVAL '1 month' - INTERVAL '1 day', 'DD/MM/YYYY'),
+          'ALUGUEL',
+          nextval('recibo_numero_seq')
+        FROM meses
+        WHERE NOT EXISTS (
+          SELECT 1 FROM parcelas_aluguel p
+          WHERE p.contrato_id = $3 AND p.competencia = meses.competencia::date
+        )
+        RETURNING *
+      `,
+      [
+        contrato.inicio,
+        contrato.fim,
+        contrato.id,
+        contrato.vencimento_dia,
+        contrato.valor_aluguel,
+        contrato.dia_repasse || contrato.vencimento_dia,
+        contrato.taxa_administracao,
+        contrato.cobrar_iptu,
+        contrato.imovel_iptu,
+        contrato.imovel_condominio,
+      ]
+    );
 
-  const updated = await query(
-    `
-      UPDATE parcelas_aluguel p
-      SET iptu_valor = CASE WHEN $2::boolean THEN COALESCE($3::numeric, 0) ELSE 0 END,
-          condominio_valor = COALESCE($4::numeric, 0),
-          valor_repasse = GREATEST(p.valor - ((p.valor * COALESCE($5::numeric, 0)) / 100), 0)
-      WHERE p.contrato_id = $1
-      RETURNING id
-    `,
-    [
-      contrato.id,
-      contrato.cobrar_iptu,
-      contrato.imovel_iptu,
-      contrato.imovel_condominio,
-      contrato.taxa_administracao,
-    ]
-  );
+    const updated = await client.query(
+      `
+        UPDATE parcelas_aluguel p
+        SET iptu_valor = CASE WHEN $2::boolean THEN COALESCE($3::numeric, 0) ELSE 0 END,
+            condominio_valor = COALESCE($4::numeric, 0),
+            valor_repasse = GREATEST(p.valor - ((p.valor * COALESCE($5::numeric, 0)) / 100), 0)
+        WHERE p.contrato_id = $1
+        RETURNING id
+      `,
+      [
+        contrato.id,
+        contrato.cobrar_iptu,
+        contrato.imovel_iptu,
+        contrato.imovel_condominio,
+        contrato.taxa_administracao,
+      ]
+    );
 
-  await logAction(req, 'gerar_parcelas', 'contratos_locacao', contrato.id, { total: inserted.rowCount, atualizadas: updated.rowCount });
-  res.json({ total: inserted.rowCount, atualizadas: updated.rowCount, parcelas: inserted.rows });
+    await logAction(req, 'gerar_parcelas', 'contratos_locacao', contrato.id, { total: inserted.rowCount, atualizadas: updated.rowCount }, { client });
+    return { total: inserted.rowCount, atualizadas: updated.rowCount, parcelas: inserted.rows };
+  });
+  if (!response) return res.status(404).json({ error: 'Contrato nao encontrado.' });
+  res.json(response);
 });
 
-app.get('/api/parcelas_aluguel', requireAuth, async (_req, res) => {
+app.get('/api/parcelas_aluguel', requireAuth, requirePermission('parcelas.read'), async (_req, res) => {
   const result = await query(`
     SELECT p.*, c.codigo contrato_codigo, i.titulo imovel_titulo, i.codigo imovel_codigo,
       locatario.nome locatario_nome, locador.nome locador_nome,
@@ -618,211 +862,245 @@ app.get('/api/parcelas_aluguel', requireAuth, async (_req, res) => {
   res.json(result.rows);
 });
 
-app.put('/api/parcelas_aluguel/:id/baixar', requireAuth, async (req, res) => {
-  const current = await query(
-    `SELECT *,
-      (valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) total_fatura,
-      GREATEST((valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) - COALESCE(valor_pago,0), 0) saldo
-     FROM parcelas_aluguel WHERE id = $1`,
-    [req.params.id]
-  );
-  const parcela = current.rows[0];
-  if (!parcela) return res.status(404).json({ error: 'Parcela nao encontrada.' });
-  const valorRecebido = invoiceBalance(parcela);
-  const forma = paymentMethod(req.body.forma_pagamento);
-  const result = await query(
-    `UPDATE parcelas_aluguel
-     SET status = 'paga',
-         pago_em = COALESCE($1::date, CURRENT_DATE),
-         ultimo_pagamento_em = COALESCE($1::date, CURRENT_DATE),
-         valor_pago = valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto,
-         recebido_de = COALESCE($2, recebido_de),
-         forma_pagamento = $3
-     WHERE id = $4 RETURNING *`,
-    [req.body.pago_em || null, req.body.recebido_de || null, forma, req.params.id]
-  );
-  await recordParcelPayment(req, req.params.id, valorRecebido, forma, req.body.pago_em, req.body.observacao);
-  await logAction(req, 'baixar_pagamento', 'parcelas_aluguel', req.params.id, { valor: valorRecebido, forma_pagamento: forma });
-  res.json(result.rows[0]);
+app.put('/api/parcelas_aluguel/:id/baixar', requireAuth, requirePermission('parcelas.write'), async (req, res) => {
+  const updated = await withTransaction(async (client) => {
+    const current = await client.query(
+      `SELECT *,
+        (valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) total_fatura,
+        GREATEST((valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) - COALESCE(valor_pago,0), 0) saldo
+       FROM parcelas_aluguel WHERE id = $1 FOR UPDATE`,
+      [req.params.id]
+    );
+    const parcela = current.rows[0];
+    if (!parcela) return null;
+    const valorRecebido = invoiceBalance(parcela);
+    const forma = paymentMethod(req.body.forma_pagamento);
+    const result = await client.query(
+      `UPDATE parcelas_aluguel
+       SET status = 'paga',
+           pago_em = COALESCE($1::date, CURRENT_DATE),
+           ultimo_pagamento_em = COALESCE($1::date, CURRENT_DATE),
+           valor_pago = valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto,
+           recebido_de = COALESCE($2, recebido_de),
+           forma_pagamento = $3
+       WHERE id = $4 RETURNING *`,
+      [req.body.pago_em || null, req.body.recebido_de || null, forma, req.params.id]
+    );
+    await recordParcelPayment(req, req.params.id, valorRecebido, forma, req.body.pago_em, req.body.observacao, client);
+    await logAction(req, 'baixar_pagamento', 'parcelas_aluguel', req.params.id, { valor: valorRecebido, forma_pagamento: forma }, { client, before: parcela, after: result.rows[0] });
+    return result.rows[0];
+  });
+  if (!updated) return res.status(404).json({ error: 'Parcela nao encontrada.' });
+  res.json(updated);
 });
 
-app.put('/api/parcelas_aluguel/:id/estornar', requireAuth, async (req, res) => {
-  const result = await query(
-    "UPDATE parcelas_aluguel SET status = 'aberta', pago_em = NULL, valor_pago = 0, ultimo_pagamento_em = NULL, forma_pagamento = NULL, estornado_em = CURRENT_DATE WHERE id = $1 RETURNING *",
-    [req.params.id]
-  );
-  if (result.rowCount === 0) return res.status(404).json({ error: 'Parcela nao encontrada.' });
-  await query('DELETE FROM pagamentos_parcela WHERE parcela_id = $1', [req.params.id]);
-  await logAction(req, 'estornar_pagamento', 'parcelas_aluguel', req.params.id);
-  res.json(result.rows[0]);
+app.put('/api/parcelas_aluguel/:id/estornar', requireAuth, requirePermission('parcelas.write'), async (req, res) => {
+  const updated = await withTransaction(async (client) => {
+    const before = await client.query('SELECT * FROM parcelas_aluguel WHERE id = $1 FOR UPDATE', [req.params.id]);
+    if (!before.rows[0]) return null;
+    const result = await client.query(
+      "UPDATE parcelas_aluguel SET status = 'aberta', pago_em = NULL, valor_pago = 0, ultimo_pagamento_em = NULL, forma_pagamento = NULL, estornado_em = CURRENT_DATE WHERE id = $1 RETURNING *",
+      [req.params.id]
+    );
+    await client.query(
+      `UPDATE pagamentos_parcela
+       SET status = 'estornado', estornado_em = now(), estornado_por = $2, motivo_estorno = COALESCE($3, motivo_estorno)
+       WHERE parcela_id = $1 AND status = 'ativo'`,
+      [req.params.id, req.session.user.id, req.body.motivo_estorno || req.body.observacao || null]
+    );
+    await logAction(req, 'estornar_pagamento', 'parcelas_aluguel', req.params.id, { motivo: req.body.motivo_estorno || null }, { client, before: before.rows[0], after: result.rows[0] });
+    return result.rows[0];
+  });
+  if (!updated) return res.status(404).json({ error: 'Parcela nao encontrada.' });
+  res.json(updated);
 });
 
-app.post('/api/parcelas_aluguel/:id/pagamento-parcial', requireAuth, async (req, res) => {
+app.post('/api/parcelas_aluguel/:id/pagamento-parcial', requireAuth, requirePermission('parcelas.write'), async (req, res) => {
   const valor = Number(req.body.valor || 0);
   if (!Number.isFinite(valor) || valor <= 0) return res.status(400).json({ error: 'Informe um valor parcial maior que zero.' });
-  const current = await query(
-    `SELECT *,
-      (valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) total_fatura,
-      GREATEST((valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) - COALESCE(valor_pago,0), 0) saldo
-     FROM parcelas_aluguel WHERE id = $1`,
-    [req.params.id]
-  );
-  const parcela = current.rows[0];
-  if (!parcela) return res.status(404).json({ error: 'Parcela nao encontrada.' });
-  const aplicado = Math.min(valor, invoiceBalance(parcela));
-  if (aplicado <= 0) return res.status(400).json({ error: 'Esta fatura ja esta quitada.' });
-  const forma = paymentMethod(req.body.forma_pagamento);
-
-  const result = await query(
-    `
-      UPDATE parcelas_aluguel
-      SET valor_pago = LEAST(
-            valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto,
-            COALESCE(valor_pago,0) + $1::numeric
-          ),
-          ultimo_pagamento_em = COALESCE($2::date, CURRENT_DATE),
-          pago_em = CASE
-            WHEN LEAST(valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto, COALESCE(valor_pago,0) + $1::numeric)
-              >= valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto
-            THEN COALESCE($2::date, CURRENT_DATE)
-            ELSE pago_em
-          END,
-          status = CASE
-            WHEN LEAST(valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto, COALESCE(valor_pago,0) + $1::numeric)
-              >= valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto
-            THEN 'paga'
-            ELSE 'parcial'
-          END,
-          forma_pagamento = $5,
-          acordo_observacao = COALESCE($3, acordo_observacao)
-      WHERE id = $4
-      RETURNING *,
+  const updated = await withTransaction(async (client) => {
+    const current = await client.query(
+      `SELECT *,
         (valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) total_fatura,
         GREATEST((valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) - COALESCE(valor_pago,0), 0) saldo
-    `,
-    [aplicado, req.body.pago_em || null, req.body.observacao || null, req.params.id, forma]
-  );
-  await recordParcelPayment(req, req.params.id, aplicado, forma, req.body.pago_em, req.body.observacao);
-  await logAction(req, 'pagamento_parcial', 'parcelas_aluguel', req.params.id, { valor: aplicado, forma_pagamento: forma, observacao: req.body.observacao || null });
-  res.json(result.rows[0]);
-});
-
-app.post('/api/contratos/:id/pagamento-parcial', requireAuth, async (req, res) => {
-  let restante = Number(req.body.valor || 0);
-  if (!Number.isFinite(restante) || restante <= 0) return res.status(400).json({ error: 'Informe um valor parcial maior que zero.' });
-  const forma = paymentMethod(req.body.forma_pagamento);
-
-  const parcelas = await query(
-    `
-      SELECT *,
-        (valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) total_fatura,
-        GREATEST((valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) - COALESCE(valor_pago,0), 0) saldo
-      FROM parcelas_aluguel
-      WHERE contrato_id = $1 AND status <> 'paga'
-      ORDER BY vencimento ASC
-    `,
-    [req.params.id]
-  );
-
-  const aplicacoes = [];
-  for (const parcela of parcelas.rows) {
-    if (restante <= 0) break;
-    const saldo = Number(parcela.saldo || 0);
-    if (saldo <= 0) continue;
-    const aplicado = Math.min(restante, saldo);
-    const updated = await query(
+       FROM parcelas_aluguel WHERE id = $1 FOR UPDATE`,
+      [req.params.id]
+    );
+    const parcela = current.rows[0];
+    if (!parcela) return { notFound: true };
+    const aplicado = Math.min(valor, invoiceBalance(parcela));
+    if (aplicado <= 0) return { invalid: 'Esta fatura ja esta quitada.' };
+    const forma = paymentMethod(req.body.forma_pagamento);
+    const result = await client.query(
       `
         UPDATE parcelas_aluguel
-        SET valor_pago = COALESCE(valor_pago,0) + $1::numeric,
+        SET valor_pago = LEAST(
+              valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto,
+              COALESCE(valor_pago,0) + $1::numeric
+            ),
             ultimo_pagamento_em = COALESCE($2::date, CURRENT_DATE),
-            pago_em = CASE WHEN COALESCE(valor_pago,0) + $1::numeric >= valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto THEN COALESCE($2::date, CURRENT_DATE) ELSE pago_em END,
-            status = CASE WHEN COALESCE(valor_pago,0) + $1::numeric >= valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto THEN 'paga' ELSE 'parcial' END,
+            pago_em = CASE
+              WHEN LEAST(valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto, COALESCE(valor_pago,0) + $1::numeric)
+                >= valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto
+              THEN COALESCE($2::date, CURRENT_DATE)
+              ELSE pago_em
+            END,
+            status = CASE
+              WHEN LEAST(valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto, COALESCE(valor_pago,0) + $1::numeric)
+                >= valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto
+              THEN 'paga'
+              ELSE 'parcial'
+            END,
             forma_pagamento = $5,
             acordo_observacao = COALESCE($3, acordo_observacao)
         WHERE id = $4
-        RETURNING id, valor_pago, status
+        RETURNING *,
+          (valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) total_fatura,
+          GREATEST((valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) - COALESCE(valor_pago,0), 0) saldo
       `,
-      [aplicado, req.body.pago_em || null, req.body.observacao || null, parcela.id, forma]
+      [aplicado, req.body.pago_em || null, req.body.observacao || null, req.params.id, forma]
     );
-    await recordParcelPayment(req, parcela.id, aplicado, forma, req.body.pago_em, req.body.observacao);
-    restante -= aplicado;
-    aplicacoes.push({ parcela_id: parcela.id, aplicado, status: updated.rows[0].status });
-  }
-
-  await logAction(req, 'pagamento_parcial_contrato', 'contratos_locacao', req.params.id, { valor: Number(req.body.valor), forma_pagamento: forma, aplicacoes, sobra: restante });
-  res.json({ aplicado: Number(req.body.valor) - restante, sobra: restante, aplicacoes });
+    await recordParcelPayment(req, req.params.id, aplicado, forma, req.body.pago_em, req.body.observacao, client);
+    await logAction(req, 'pagamento_parcial', 'parcelas_aluguel', req.params.id, { valor: aplicado, forma_pagamento: forma, observacao: req.body.observacao || null }, { client, before: parcela, after: result.rows[0] });
+    return { row: result.rows[0] };
+  });
+  if (updated.notFound) return res.status(404).json({ error: 'Parcela nao encontrada.' });
+  if (updated.invalid) return res.status(400).json({ error: updated.invalid });
+  res.json(updated.row);
 });
 
-app.post('/api/contratos/:id/fatura-avulsa', requireAuth, async (req, res) => {
+app.post('/api/contratos/:id/pagamento-parcial', requireAuth, requirePermission('parcelas.write'), async (req, res) => {
+  let restante = Number(req.body.valor || 0);
+  if (!Number.isFinite(restante) || restante <= 0) return res.status(400).json({ error: 'Informe um valor parcial maior que zero.' });
+  const forma = paymentMethod(req.body.forma_pagamento);
+  const response = await withTransaction(async (client) => {
+    const parcelas = await client.query(
+      `
+        SELECT *,
+          (valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) total_fatura,
+          GREATEST((valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) - COALESCE(valor_pago,0), 0) saldo
+        FROM parcelas_aluguel
+      WHERE contrato_id = $1 AND status NOT IN ('paga','cancelada')
+        ORDER BY vencimento ASC
+        FOR UPDATE
+      `,
+      [req.params.id]
+    );
+
+    const aplicacoes = [];
+    for (const parcela of parcelas.rows) {
+      if (restante <= 0) break;
+      const saldo = Number(parcela.saldo || 0);
+      if (saldo <= 0) continue;
+      const aplicado = Math.min(restante, saldo);
+      const updated = await client.query(
+        `
+          UPDATE parcelas_aluguel
+          SET valor_pago = COALESCE(valor_pago,0) + $1::numeric,
+              ultimo_pagamento_em = COALESCE($2::date, CURRENT_DATE),
+              pago_em = CASE WHEN COALESCE(valor_pago,0) + $1::numeric >= valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto THEN COALESCE($2::date, CURRENT_DATE) ELSE pago_em END,
+              status = CASE WHEN COALESCE(valor_pago,0) + $1::numeric >= valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto THEN 'paga' ELSE 'parcial' END,
+              forma_pagamento = $5,
+              acordo_observacao = COALESCE($3, acordo_observacao)
+          WHERE id = $4
+          RETURNING id, valor_pago, status
+        `,
+        [aplicado, req.body.pago_em || null, req.body.observacao || null, parcela.id, forma]
+      );
+      await recordParcelPayment(req, parcela.id, aplicado, forma, req.body.pago_em, req.body.observacao, client);
+      restante -= aplicado;
+      aplicacoes.push({ parcela_id: parcela.id, aplicado, status: updated.rows[0].status });
+    }
+
+    await logAction(req, 'pagamento_parcial_contrato', 'contratos_locacao', req.params.id, { valor: Number(req.body.valor), forma_pagamento: forma, aplicacoes, sobra: restante }, { client });
+    return { aplicado: Number(req.body.valor) - restante, sobra: restante, aplicacoes };
+  });
+  res.json(response);
+});
+
+app.post('/api/contratos/:id/fatura-avulsa', requireAuth, requirePermission('parcelas.write'), async (req, res) => {
   const valor = Number(req.body.valor || 0);
   if (!Number.isFinite(valor) || valor <= 0) return res.status(400).json({ error: 'Informe o valor da fatura avulsa.' });
   const parcelas = Math.max(1, Math.floor(Number(req.body.parcelas || 1)));
   if (!Number.isFinite(parcelas) || parcelas < 1) return res.status(400).json({ error: 'Informe um numero valido de parcelas.' });
-
-  const contratoResult = await query('SELECT * FROM contratos_locacao WHERE id = $1', [req.params.id]);
-  const contrato = contratoResult.rows[0];
-  if (!contrato) return res.status(404).json({ error: 'Contrato nao encontrado.' });
 
   const competencia = req.body.competencia || req.body.vencimento || new Date().toISOString().slice(0, 10);
   const vencimento = req.body.vencimento || competencia;
   const categoria = req.body.categoria || 'ACORDO';
   const descricao = req.body.descricao || 'Fatura avulsa';
   const repasse = Number(req.body.valor_repasse || 0);
-  const created = [];
-  for (let index = 0; index < parcelas; index += 1) {
-    const parcelaValor = categoria === 'IPTU'
-      ? Math.round((valor / parcelas) * 100) / 100
-      : valor;
-    const ajusteFinal = categoria === 'IPTU' && index === parcelas - 1
-      ? Math.round((valor - (Math.round((valor / parcelas) * 100) / 100) * (parcelas - 1)) * 100) / 100
-      : parcelaValor;
-    const result = await query(
-      `
-        INSERT INTO parcelas_aluguel
-          (contrato_id, competencia, vencimento, repasse_vencimento, valor, valor_repasse, iptu_valor, condominio_valor, descricao, categoria, recibo_numero, origem, acordo_observacao)
-        VALUES
-          ($1, $2::date, $3::date, $4::date, $5, $6, $7, $8, $9, $10, nextval('recibo_numero_seq'), 'avulsa', $11)
-        RETURNING *
-      `,
-      [
-        contrato.id,
-        addMonthsIso(competencia, index),
-        addMonthsIso(vencimento, index),
-        req.body.repasse_vencimento ? addMonthsIso(req.body.repasse_vencimento, index) : addMonthsIso(vencimento, index),
-        categoria === 'IPTU' ? 0 : valor,
-        repasse,
-        categoria === 'IPTU' ? ajusteFinal : Number(req.body.iptu_valor || 0),
-        Number(req.body.condominio_valor || 0),
-        parcelas > 1 ? `${descricao} (${index + 1}/${parcelas})` : descricao,
-        categoria,
-        req.body.observacao || null,
-      ]
-    );
-    created.push(result.rows[0]);
-  }
+  const response = await withTransaction(async (client) => {
+    const contratoResult = await client.query('SELECT * FROM contratos_locacao WHERE id = $1 FOR UPDATE', [req.params.id]);
+    const contrato = contratoResult.rows[0];
+    if (!contrato) return null;
+    const created = [];
+    for (let index = 0; index < parcelas; index += 1) {
+      const parcelaValor = categoria === 'IPTU'
+        ? Math.round((valor / parcelas) * 100) / 100
+        : valor;
+      const ajusteFinal = categoria === 'IPTU' && index === parcelas - 1
+        ? Math.round((valor - (Math.round((valor / parcelas) * 100) / 100) * (parcelas - 1)) * 100) / 100
+        : parcelaValor;
+      const result = await client.query(
+        `
+          INSERT INTO parcelas_aluguel
+            (contrato_id, competencia, vencimento, repasse_vencimento, valor, valor_repasse, iptu_valor, condominio_valor, descricao, categoria, recibo_numero, origem, acordo_observacao)
+          VALUES
+            ($1, $2::date, $3::date, $4::date, $5, $6, $7, $8, $9, $10, nextval('recibo_numero_seq'), 'avulsa', $11)
+          RETURNING *
+        `,
+        [
+          contrato.id,
+          addMonthsIso(competencia, index),
+          addMonthsIso(vencimento, index),
+          req.body.repasse_vencimento ? addMonthsIso(req.body.repasse_vencimento, index) : addMonthsIso(vencimento, index),
+          categoria === 'IPTU' ? 0 : valor,
+          repasse,
+          categoria === 'IPTU' ? ajusteFinal : Number(req.body.iptu_valor || 0),
+          Number(req.body.condominio_valor || 0),
+          parcelas > 1 ? `${descricao} (${index + 1}/${parcelas})` : descricao,
+          categoria,
+          req.body.observacao || null,
+        ]
+      );
+      created.push(result.rows[0]);
+    }
 
-  await logAction(req, 'fatura_avulsa', 'contratos_locacao', contrato.id, { total: created.length, categoria, parcelas });
-  res.status(201).json({ total: created.length, parcelas: created });
+    await logAction(req, 'fatura_avulsa', 'contratos_locacao', contrato.id, { total: created.length, categoria, parcelas }, { client });
+    return { total: created.length, parcelas: created };
+  });
+  if (!response) return res.status(404).json({ error: 'Contrato nao encontrado.' });
+  res.status(201).json(response);
 });
 
-app.put('/api/parcelas_aluguel/:id/repassar', requireAuth, async (req, res) => {
+app.put('/api/parcelas_aluguel/:id/repassar', requireAuth, requirePermission('parcelas.write'), async (req, res) => {
+  const updated = await withTransaction(async (client) => {
+    const before = await client.query('SELECT * FROM parcelas_aluguel WHERE id = $1 FOR UPDATE', [req.params.id]);
+    if (!before.rows[0]) return null;
+    const result = await client.query(
+      "UPDATE parcelas_aluguel SET repassado_em = COALESCE($1::date, CURRENT_DATE) WHERE id = $2 RETURNING *",
+      [req.body.repassado_em || null, req.params.id]
+    );
+    await logAction(req, 'repassar_proprietario', 'parcelas_aluguel', req.params.id, {}, { client, before: before.rows[0], after: result.rows[0] });
+    return result.rows[0];
+  });
+  if (!updated) return res.status(404).json({ error: 'Parcela nao encontrada.' });
+  res.json(updated);
+});
+
+app.delete('/api/parcelas_aluguel/:id', requireAuth, requirePermission('parcelas.delete'), async (req, res) => {
   const result = await query(
-    "UPDATE parcelas_aluguel SET repassado_em = COALESCE($1::date, CURRENT_DATE) WHERE id = $2 RETURNING *",
-    [req.body.repassado_em || null, req.params.id]
+    `UPDATE parcelas_aluguel
+     SET status = 'cancelada', cancelado_em = now(), cancelado_por = $2, motivo_cancelamento = COALESCE($3, motivo_cancelamento)
+     WHERE id = $1 RETURNING *`,
+    [req.params.id, req.session.user.id, req.body.motivo_cancelamento || null]
   );
   if (result.rowCount === 0) return res.status(404).json({ error: 'Parcela nao encontrada.' });
-  await logAction(req, 'repassar_proprietario', 'parcelas_aluguel', req.params.id);
-  res.json(result.rows[0]);
-});
-
-app.delete('/api/parcelas_aluguel/:id', requireAuth, async (req, res) => {
-  const result = await query('DELETE FROM parcelas_aluguel WHERE id = $1 RETURNING id', [req.params.id]);
-  if (result.rowCount === 0) return res.status(404).json({ error: 'Parcela nao encontrada.' });
-  await logAction(req, 'excluir', 'parcelas_aluguel', req.params.id);
+  await logAction(req, 'cancelar', 'parcelas_aluguel', req.params.id, { motivo: req.body.motivo_cancelamento || null }, { after: result.rows[0] });
   res.json({ ok: true });
 });
 
-app.get('/api/pontualidade/:contratoId', requireAuth, async (req, res) => {
+app.get('/api/pontualidade/:contratoId', requireAuth, requirePermission('parcelas.read'), async (req, res) => {
   const result = await query(`
     SELECT EXTRACT(YEAR FROM competencia)::int ano,
       EXTRACT(MONTH FROM competencia)::int mes,
@@ -862,7 +1140,7 @@ const reportSql = {
       JOIN contratos_locacao c ON c.id = p.contrato_id
       LEFT JOIN imoveis i ON i.id = c.imovel_id
       LEFT JOIN pessoas locatario ON locatario.id = c.locatario_id
-      WHERE p.status <> 'paga' AND p.vencimento < CURRENT_DATE
+      WHERE p.status NOT IN ('paga','cancelada') AND p.vencimento < CURRENT_DATE
       ORDER BY p.vencimento ASC
     `,
     params: false,
@@ -878,7 +1156,7 @@ const reportSql = {
       JOIN contratos_locacao c ON c.id = p.contrato_id
       LEFT JOIN imoveis i ON i.id = c.imovel_id
       LEFT JOIN pessoas locatario ON locatario.id = c.locatario_id
-      WHERE p.status <> 'paga' AND p.vencimento BETWEEN $1::date AND $2::date
+      WHERE p.status NOT IN ('paga','cancelada') AND p.vencimento BETWEEN $1::date AND $2::date
       ORDER BY p.vencimento ASC
     `,
   },
@@ -970,8 +1248,8 @@ const reportSql = {
       SELECT 'Imoveis disponiveis' indicador, COUNT(*)::numeric valor FROM imoveis WHERE status = 'disponivel'
       UNION ALL SELECT 'Imoveis alugados', COUNT(*)::numeric FROM imoveis WHERE status = 'alugado'
       UNION ALL SELECT 'Contratos ativos', COUNT(*)::numeric FROM contratos_locacao WHERE status = 'ativo'
-      UNION ALL SELECT 'Faturas abertas', COUNT(*)::numeric FROM parcelas_aluguel WHERE status <> 'paga'
-      UNION ALL SELECT 'Saldo a receber', COALESCE(SUM(GREATEST((valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) - COALESCE(valor_pago,0), 0)),0)::numeric FROM parcelas_aluguel WHERE status <> 'paga'
+      UNION ALL SELECT 'Faturas abertas', COUNT(*)::numeric FROM parcelas_aluguel WHERE status NOT IN ('paga','cancelada')
+      UNION ALL SELECT 'Saldo a receber', COALESCE(SUM(GREATEST((valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) - COALESCE(valor_pago,0), 0)),0)::numeric FROM parcelas_aluguel WHERE status NOT IN ('paga','cancelada')
       UNION ALL SELECT 'Saldo a repassar', COALESCE(SUM(valor_repasse),0)::numeric FROM parcelas_aluguel WHERE repassado_em IS NULL
     `,
     params: false,
@@ -1205,7 +1483,7 @@ const reportSql = {
   },
 };
 
-app.get('/api/relatorios/locacao', requireAuth, async (req, res) => {
+app.get('/api/relatorios/locacao', requireAuth, requirePermission('relatorios.read'), async (req, res) => {
   const tipo = req.query.tipo || 'panorama';
   const report = reportSql[tipo];
   if (!report) return res.status(404).json({ error: 'Relatorio nao encontrado.' });
@@ -1214,7 +1492,7 @@ app.get('/api/relatorios/locacao', requireAuth, async (req, res) => {
   res.json({ tipo, titulo: report.title, inicio: params[0] || null, fim: params[1] || null, rows: result.rows });
 });
 
-app.get('/api/recibo/:parcelaId', requireAuth, async (req, res) => {
+app.get('/api/recibo/:parcelaId', requireAuth, requirePermission('recibos.read'), async (req, res) => {
   const result = await query(`
     SELECT p.*, c.codigo contrato_codigo, i.codigo imovel_codigo, i.titulo imovel_titulo, i.endereco imovel_endereco,
       locatario.nome locatario_nome, locatario.cpf_cnpj locatario_doc,
@@ -1232,7 +1510,7 @@ app.get('/api/recibo/:parcelaId', requireAuth, async (req, res) => {
   const total = invoiceTotal(p);
   const saldo = invoiceBalance(p);
   const pagamentosResult = await query(
-    'SELECT valor, forma_pagamento, pago_em, observacao FROM pagamentos_parcela WHERE parcela_id = $1 ORDER BY pago_em ASC, criado_em ASC',
+    "SELECT valor, forma_pagamento, pago_em, observacao FROM pagamentos_parcela WHERE parcela_id = $1 AND status = 'ativo' ORDER BY pago_em ASC, criado_em ASC",
     [p.id]
   );
   const pagamentos = pagamentosResult.rows.length
@@ -1311,7 +1589,7 @@ app.get('/api/recibo/:parcelaId', requireAuth, async (req, res) => {
   </style></head><body><div class="toolbar"><button onclick="print()">Imprimir 80 mm</button></div>${recibo80}</body></html>`);
 });
 
-app.get('/api/contratos/:id/documento', requireAuth, async (req, res) => {
+app.get('/api/contratos/:id/documento', requireAuth, requirePermission('documentos.read'), async (req, res) => {
   const result = await query(`
     SELECT c.*, i.titulo imovel_titulo, i.endereco imovel_endereco, i.bairro, i.cidade, i.uf, i.cep, i.energia_instalacao cemig_unidade,
       locador.nome locador_nome, locador.cpf_cnpj locador_doc, locador.endereco locador_endereco,
@@ -1522,7 +1800,7 @@ app.get('/api/contratos/:id/documento', requireAuth, async (req, res) => {
 </html>`);
 });
 
-app.put('/api/contratos/:id/documento-personalizado', requireAuth, async (req, res) => {
+app.put('/api/contratos/:id/documento-personalizado', requireAuth, requirePermission('contratos.write'), async (req, res) => {
   const documento = String(req.body.documento_personalizado || '').trim();
   const result = await query(
     `UPDATE contratos_locacao
@@ -1537,7 +1815,7 @@ app.put('/api/contratos/:id/documento-personalizado', requireAuth, async (req, r
   res.json(result.rows[0]);
 });
 
-app.get('/api/backup', requireAuth, async (_req, res) => {
+app.get('/api/backup', requireAuth, requirePermission('backup.read'), async (_req, res) => {
   const tables = [
     'usuarios',
     'pessoas',
@@ -1578,7 +1856,7 @@ initDatabase()
   .then(() => {
     app.listen(port, () => {
       console.log(`IGS Imob PRO rodando em http://localhost:${port}`);
-      console.log('Login inicial: admin@igs.local / 123');
+      console.log('Use o administrador configurado em INITIAL_ADMIN_EMAIL.');
     });
   })
   .catch((error) => {
