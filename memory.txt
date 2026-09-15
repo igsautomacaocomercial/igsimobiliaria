@@ -13,3 +13,8 @@ Decisoes recentes:
 - Operacoes financeiras que gravam parcela/pagamento/log devem usar transacao PostgreSQL via `withTransaction`.
 - Estorno de pagamento nao pode deletar `pagamentos_parcela`; deve marcar como `status = estornado` com usuario/data/motivo.
 - E-mails devem ser salvos normalizados com trim/lowercase; CPF/CNPJ deve ser salvo apenas com numeros.
+- Fase 02: inadimplencia deve usar `parcelas_aluguel` existentes, sem tabela duplicada de divida; historico operacional fica em `cobrancas_historico`.
+- Multa/juros de inadimplencia sao calculados em service com juros proporcional por dia: juros_mensal / 30 * dias_atraso.
+- Repasses nao podem duplicar: parcelas/despesas recebem `repasse_id`; contas descontadas recebem `descontado_repasse_em`.
+- Reajustes devem gravar `contrato_reajustes` e `contrato_eventos`; nao alterar parcelas pagas, canceladas ou competencias anteriores a data-base.
+- WhatsApp da cobranca nesta fase apenas abre link com mensagem; nao enviar automaticamente por API externa.

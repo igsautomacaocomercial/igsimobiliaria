@@ -10,6 +10,14 @@ const bcrypt = require('bcryptjs');
 const { initDatabase, query, pool, normalizeEmail } = require('./db');
 const { can, requirePermission, normalizeRole } = require('./middleware/permissions');
 const { withTransaction } = require('./utils/transaction');
+const {
+  calculateLateFees,
+  whatsappLink,
+  renderChargeMessage,
+} = require('./services/inadimplencia.service');
+const { repasseItemTotals, summarizeRepasse } = require('./services/repasse.service');
+const { calculateAdjustedRent, addMonthsIso: addMonthsIsoService } = require('./services/reajuste.service');
+const { recordContractEvent } = require('./services/contrato-eventos.service');
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -572,6 +580,388 @@ app.get('/api/dashboard', requireAuth, requirePermission('dashboard.read'), asyn
   });
 });
 
+async function financeiroConfig() {
+  const result = await query("SELECT valor FROM configuracoes WHERE chave = 'financeiro'");
+  return result.rows[0]?.valor || { multa_percentual: 2, juros_mensal_percentual: 1 };
+}
+
+async function imobiliariaConfig() {
+  const result = await query("SELECT valor FROM configuracoes WHERE chave = 'imobiliaria'");
+  return result.rows[0]?.valor || { nome: 'IGS Imobiliaria' };
+}
+
+async function whatsappTemplate() {
+  const result = await query("SELECT valor FROM configuracoes WHERE chave = 'cobranca_whatsapp'");
+  return result.rows[0]?.valor?.modelo || '';
+}
+
+async function overdueRows() {
+  const result = await query(`
+    SELECT p.*, c.codigo contrato_codigo, c.cobrar_multa, c.cobrar_juros, c.responsavel,
+      i.titulo imovel_titulo, i.codigo imovel_codigo,
+      locatario.id locatario_id, locatario.nome locatario_nome, locatario.telefone locatario_telefone, locatario.whatsapp locatario_whatsapp,
+      h.tipo ultima_acao_tipo, h.status ultima_acao_status, h.observacao ultima_acao_observacao, h.criado_em ultima_acao_em
+    FROM parcelas_aluguel p
+    JOIN contratos_locacao c ON c.id = p.contrato_id
+    LEFT JOIN imoveis i ON i.id = c.imovel_id
+    LEFT JOIN pessoas locatario ON locatario.id = c.locatario_id
+    LEFT JOIN LATERAL (
+      SELECT tipo, status, observacao, criado_em
+      FROM cobrancas_historico ch
+      WHERE ch.parcela_id = p.id
+      ORDER BY ch.criado_em DESC
+      LIMIT 1
+    ) h ON TRUE
+    WHERE p.status IN ('aberta','parcial') AND p.vencimento < CURRENT_DATE
+    ORDER BY p.vencimento ASC
+  `);
+  const config = await financeiroConfig();
+  return result.rows.map((row) => ({ ...row, encargos: calculateLateFees(row, row, config) }));
+}
+
+app.get('/api/operacional', requireAuth, requirePermission('operacional.read'), async (_req, res) => {
+  const [atrasadas, hoje, sete, recebidosHoje, repasses, reajustes, vencendo30, vencendo60, chaves] = await Promise.all([
+    query("SELECT COUNT(*)::int total, COALESCE(SUM(GREATEST((valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) - COALESCE(valor_pago,0),0)),0)::numeric valor FROM parcelas_aluguel WHERE status IN ('aberta','parcial') AND vencimento < CURRENT_DATE"),
+    query("SELECT COUNT(*)::int total, COALESCE(SUM(GREATEST((valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) - COALESCE(valor_pago,0),0)),0)::numeric valor FROM parcelas_aluguel WHERE status IN ('aberta','parcial') AND vencimento = CURRENT_DATE"),
+    query("SELECT COUNT(*)::int total, COALESCE(SUM(GREATEST((valor + COALESCE(iptu_valor,0) + COALESCE(condominio_valor,0) + multa + juros - desconto) - COALESCE(valor_pago,0),0)),0)::numeric valor FROM parcelas_aluguel WHERE status IN ('aberta','parcial') AND vencimento BETWEEN CURRENT_DATE + INTERVAL '1 day' AND CURRENT_DATE + INTERVAL '7 days'"),
+    query("SELECT COUNT(*)::int total, COALESCE(SUM(valor),0)::numeric valor FROM pagamentos_parcela WHERE status = 'ativo' AND pago_em = CURRENT_DATE"),
+    query("SELECT COUNT(DISTINCT c.locador_id)::int proprietarios, COUNT(*)::int total, COALESCE(SUM(p.valor_repasse),0)::numeric valor FROM parcelas_aluguel p JOIN contratos_locacao c ON c.id = p.contrato_id WHERE p.status = 'paga' AND p.repasse_id IS NULL AND p.repassado_em IS NULL"),
+    query("SELECT COUNT(*)::int total FROM contratos_locacao WHERE status = 'ativo' AND proximo_reajuste <= CURRENT_DATE"),
+    query("SELECT COUNT(*)::int total FROM contratos_locacao WHERE status = 'ativo' AND fim BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days'"),
+    query("SELECT COUNT(*)::int total FROM contratos_locacao WHERE status = 'ativo' AND fim BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '60 days'"),
+    query('SELECT COUNT(*)::int total FROM emprestimos_chaves WHERE devolvida_em IS NULL'),
+  ]);
+  const overdue = await overdueRows();
+  const prioridades = overdue.slice(0, 8).map((row) => ({
+    tipo: 'inadimplencia',
+    gravidade: row.encargos.dias_atraso,
+    titulo: `${row.encargos.dias_atraso} dias em atraso`,
+    contrato: row.contrato_codigo,
+    locatario: row.locatario_nome,
+    imovel: row.imovel_titulo,
+    saldo: row.encargos.saldo_atualizado,
+    parcela_id: row.id,
+  }));
+  res.json({
+    cards: {
+      alugueisAtrasados: atrasadas.rows[0],
+      alugueisHoje: hoje.rows[0],
+      alugueis7Dias: sete.rows[0],
+      recebidosHoje: recebidosHoje.rows[0],
+      repassesPendentes: repasses.rows[0],
+      contratosReajustePendente: reajustes.rows[0].total,
+      contratosVencendo30: vencendo30.rows[0].total,
+      contratosVencendo60: vencendo60.rows[0].total,
+      chavesNaoDevolvidas: chaves.rows[0].total,
+    },
+    prioridades,
+  });
+});
+
+app.get('/api/inadimplencia', requireAuth, requirePermission('inadimplencia.read'), async (req, res) => {
+  let rows = await overdueRows();
+  const min = Number(req.query.atraso_min || 0);
+  const max = Number(req.query.atraso_max || 0);
+  const term = String(req.query.busca || '').toLowerCase();
+  if (min) rows = rows.filter((row) => row.encargos.dias_atraso >= min);
+  if (max) rows = rows.filter((row) => row.encargos.dias_atraso <= max);
+  if (term) rows = rows.filter((row) => [row.locatario_nome, row.imovel_titulo, row.contrato_codigo].some((value) => String(value || '').toLowerCase().includes(term)));
+  const order = req.query.ordem || 'maior_atraso';
+  rows.sort((a, b) => {
+    if (order === 'maior_divida') return b.encargos.saldo_atualizado - a.encargos.saldo_atualizado;
+    if (order === 'nome') return String(a.locatario_nome || '').localeCompare(String(b.locatario_nome || ''));
+    if (order === 'vencimento') return String(a.vencimento).localeCompare(String(b.vencimento));
+    return b.encargos.dias_atraso - a.encargos.dias_atraso;
+  });
+  res.json(rows);
+});
+
+app.get('/api/inadimplencia/:parcelaId', requireAuth, requirePermission('inadimplencia.read'), async (req, res) => {
+  const timeline = await query(`
+    SELECT ch.*, u.nome usuario_nome
+    FROM cobrancas_historico ch
+    LEFT JOIN usuarios u ON u.id = ch.usuario_id
+    WHERE ch.parcela_id = $1
+    ORDER BY ch.criado_em DESC
+  `, [req.params.parcelaId]);
+  res.json({ timeline: timeline.rows });
+});
+
+app.post('/api/inadimplencia/:parcelaId/acao', requireAuth, requirePermission('inadimplencia.write'), async (req, res) => {
+  const parcela = await query(`
+    SELECT p.*, c.locatario_id FROM parcelas_aluguel p
+    JOIN contratos_locacao c ON c.id = p.contrato_id
+    WHERE p.id = $1 AND p.status IN ('aberta','parcial')
+  `, [req.params.parcelaId]);
+  if (!parcela.rows[0]) return res.status(400).json({ error: 'Parcela inexistente, paga ou cancelada.' });
+  const result = await query(
+    `INSERT INTO cobrancas_historico (parcela_id, contrato_id, locatario_id, usuario_id, tipo, status, observacao, proxima_acao_em)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+    [req.params.parcelaId, parcela.rows[0].contrato_id, parcela.rows[0].locatario_id, req.session.user.id, req.body.tipo || 'observacao', req.body.status || 'enviado', req.body.observacao || null, req.body.proxima_acao_em || null]
+  );
+  await logAction(req, 'registrar_cobranca', 'parcelas_aluguel', req.params.parcelaId, result.rows[0]);
+  res.status(201).json(result.rows[0]);
+});
+
+app.post('/api/inadimplencia/:parcelaId/negociar', requireAuth, requirePermission('inadimplencia.write'), async (req, res) => {
+  const desconto = Number(req.body.desconto || 0);
+  if (desconto < 0) return res.status(400).json({ error: 'Desconto invalido.' });
+  const response = await withTransaction(async (client) => {
+    const parcela = await client.query("SELECT * FROM parcelas_aluguel WHERE id = $1 AND status IN ('aberta','parcial') FOR UPDATE", [req.params.parcelaId]);
+    if (!parcela.rows[0]) return null;
+    const acordo = await client.query(
+      `INSERT INTO acordos_cobranca (parcela_id, usuario_id, desconto, nova_data, motivo, observacao)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [req.params.parcelaId, req.session.user.id, desconto, req.body.nova_data || null, req.body.motivo || null, req.body.observacao || null]
+    );
+    const updated = await client.query(
+      `UPDATE parcelas_aluguel
+       SET desconto = COALESCE(desconto,0) + $2::numeric,
+           vencimento = COALESCE($3::date, vencimento),
+           acordo_observacao = COALESCE($4, acordo_observacao)
+       WHERE id = $1 RETURNING *`,
+      [req.params.parcelaId, desconto, req.body.nova_data || null, req.body.observacao || null]
+    );
+    await client.query(
+      `INSERT INTO cobrancas_historico (parcela_id, contrato_id, usuario_id, tipo, status, observacao, proxima_acao_em)
+       VALUES ($1, $2, $3, 'acordo', 'negociacao', $4, $5)`,
+      [req.params.parcelaId, parcela.rows[0].contrato_id, req.session.user.id, req.body.observacao || null, req.body.proxima_acao_em || null]
+    );
+    await logAction(req, 'negociar_cobranca', 'parcelas_aluguel', req.params.parcelaId, acordo.rows[0], { client, before: parcela.rows[0], after: updated.rows[0] });
+    return updated.rows[0];
+  });
+  if (!response) return res.status(400).json({ error: 'Nao e possivel negociar fatura paga ou cancelada.' });
+  res.json(response);
+});
+
+app.get('/api/inadimplencia/:parcelaId/whatsapp', requireAuth, requirePermission('inadimplencia.read'), async (req, res) => {
+  const rows = await overdueRows();
+  const row = rows.find((item) => item.id === req.params.parcelaId);
+  if (!row) return res.status(404).json({ error: 'Cobranca nao encontrada.' });
+  const template = await whatsappTemplate();
+  const imobiliaria = await imobiliariaConfig();
+  const message = renderChargeMessage(template, {
+    nome: row.locatario_nome,
+    contrato: row.contrato_codigo,
+    imovel: row.imovel_titulo,
+    data: brDate(row.vencimento),
+    valor: brl(row.encargos.saldo_atualizado),
+    imobiliaria: imobiliaria.nome || 'IGS Imobiliaria',
+  });
+  res.json({ message, url: whatsappLink(row.locatario_whatsapp || row.locatario_telefone, message) });
+});
+
+async function repasseComposition(proprietarioId) {
+  const parcelas = await query(`
+    SELECT p.*, c.codigo contrato_codigo, c.locador_id, c.locatario_id, c.taxa_administracao, c.taxa_intermediacao,
+      c.taxa_minima, c.repassar_multa, c.repassar_juros, c.repassar_iptu, c.descontar_irrf,
+      i.titulo imovel_titulo, i.id imovel_id, locatario.nome locatario_nome
+    FROM parcelas_aluguel p
+    JOIN contratos_locacao c ON c.id = p.contrato_id
+    LEFT JOIN imoveis i ON i.id = c.imovel_id
+    LEFT JOIN pessoas locatario ON locatario.id = c.locatario_id
+    WHERE c.locador_id = $1
+      AND p.status = 'paga'
+      AND p.repasse_id IS NULL
+      AND p.repassado_em IS NULL
+      AND COALESCE(p.valor_pago,0) > 0
+    ORDER BY p.competencia ASC, c.codigo ASC
+  `, [proprietarioId]);
+  const despesas = await query(`
+    SELECT cp.*
+    FROM contas_pagar cp
+    JOIN imoveis i ON i.id = cp.imovel_id
+    WHERE i.proprietario_id = $1
+      AND cp.status = 'paga'
+      AND cp.descontar_repasse = TRUE
+      AND cp.repasse_id IS NULL
+      AND cp.descontado_repasse_em IS NULL
+    ORDER BY cp.vencimento ASC
+  `, [proprietarioId]);
+  const totals = summarizeRepasse(parcelas.rows, despesas.rows);
+  return { parcelas: parcelas.rows, despesas: despesas.rows, totals };
+}
+
+app.get('/api/repasses', requireAuth, requirePermission('repasses.read'), async (_req, res) => {
+  const proprietarios = await query(`
+    SELECT DISTINCT locador.id, locador.nome, locador.cpf_cnpj
+    FROM parcelas_aluguel p
+    JOIN contratos_locacao c ON c.id = p.contrato_id
+    JOIN pessoas locador ON locador.id = c.locador_id
+    WHERE p.status = 'paga' AND p.repasse_id IS NULL AND p.repassado_em IS NULL AND COALESCE(p.valor_pago,0) > 0
+    ORDER BY locador.nome
+  `);
+  const rows = [];
+  for (const proprietario of proprietarios.rows) {
+    const composition = await repasseComposition(proprietario.id);
+    rows.push({ ...proprietario, ...composition.totals, imoveis: new Set(composition.parcelas.map((p) => p.imovel_id).filter(Boolean)).size });
+  }
+  res.json(rows);
+});
+
+app.get('/api/repasses/:proprietarioId/composicao', requireAuth, requirePermission('repasses.read'), async (req, res) => {
+  const composition = await repasseComposition(req.params.proprietarioId);
+  res.json({
+    ...composition,
+    parcelas: composition.parcelas.map((row) => ({ ...row, totais_repasse: repasseItemTotals(row) })),
+  });
+});
+
+app.post('/api/repasses/:proprietarioId/marcar', requireAuth, requirePermission('repasses.write'), async (req, res) => {
+  const response = await withTransaction(async (client) => {
+    const proprietario = await client.query('SELECT id, nome FROM pessoas WHERE id = $1 FOR UPDATE', [req.params.proprietarioId]);
+    if (!proprietario.rows[0]) return { notFound: true };
+    const parcelas = await client.query(`
+      SELECT p.*, c.codigo contrato_codigo, c.locador_id, c.taxa_administracao, c.taxa_intermediacao,
+        c.taxa_minima, c.repassar_multa, c.repassar_juros, c.repassar_iptu, c.descontar_irrf
+      FROM parcelas_aluguel p
+      JOIN contratos_locacao c ON c.id = p.contrato_id
+      WHERE c.locador_id = $1 AND p.status = 'paga' AND p.repasse_id IS NULL AND p.repassado_em IS NULL AND COALESCE(p.valor_pago,0) > 0
+      FOR UPDATE OF p
+    `, [req.params.proprietarioId]);
+    if (!parcelas.rows.length) return { invalid: 'Nao ha parcelas recebidas pendentes de repasse.' };
+    const despesas = await client.query(`
+      SELECT cp.*
+      FROM contas_pagar cp
+      JOIN imoveis i ON i.id = cp.imovel_id
+      WHERE i.proprietario_id = $1 AND cp.status = 'paga' AND cp.descontar_repasse = TRUE
+        AND cp.repasse_id IS NULL AND cp.descontado_repasse_em IS NULL
+      FOR UPDATE OF cp
+    `, [req.params.proprietarioId]);
+    const totals = summarizeRepasse(parcelas.rows, despesas.rows);
+    const repasse = await client.query(
+      `INSERT INTO repasses_proprietario
+        (proprietario_id, competencia, valor_bruto, comissao, descontos, taxa_administracao_total, valor_repasse, valor_liquido, repassado_em, status, forma_pagamento, observacao, usuario_id)
+       VALUES ($1, COALESCE($2::date, CURRENT_DATE), $3, $4, $5, $4, $6, $6, COALESCE($7::date, CURRENT_DATE), 'pago', $8, $9, $10)
+       RETURNING *`,
+      [req.params.proprietarioId, req.body.competencia || null, totals.bruto, totals.taxa, totals.despesas, totals.liquido, req.body.repassado_em || null, req.body.forma_pagamento || 'PIX', req.body.observacao || null, req.session.user.id]
+    );
+    await client.query('UPDATE parcelas_aluguel SET repasse_id = $1, repassado_em = COALESCE($2::date, CURRENT_DATE) WHERE id = ANY($3::uuid[])', [repasse.rows[0].id, req.body.repassado_em || null, parcelas.rows.map((row) => row.id)]);
+    if (despesas.rows.length) {
+      await client.query('UPDATE contas_pagar SET repasse_id = $1, descontado_repasse_em = now() WHERE id = ANY($2::uuid[])', [repasse.rows[0].id, despesas.rows.map((row) => row.id)]);
+    }
+    await logAction(req, 'efetivar_repasse', 'repasses_proprietario', repasse.rows[0].id, { parcelas: parcelas.rowCount, despesas: despesas.rowCount, totals }, { client, after: repasse.rows[0] });
+    return repasse.rows[0];
+  });
+  if (response.notFound) return res.status(404).json({ error: 'Proprietario nao encontrado.' });
+  if (response.invalid) return res.status(400).json({ error: response.invalid });
+  res.status(201).json(response);
+});
+
+app.get('/api/repasses/:id/demonstrativo', requireAuth, requirePermission('repasses.read'), async (req, res) => {
+  const repasse = await query(`
+    SELECT r.*, p.nome proprietario_nome, p.cpf_cnpj proprietario_doc
+    FROM repasses_proprietario r
+    LEFT JOIN pessoas p ON p.id = r.proprietario_id
+    WHERE r.id = $1
+  `, [req.params.id]);
+  const row = repasse.rows[0];
+  if (!row) return res.status(404).send('Repasse nao encontrado.');
+  const parcelas = await query(`
+    SELECT p.*, c.codigo contrato_codigo, i.titulo imovel_titulo, locatario.nome locatario_nome
+    FROM parcelas_aluguel p
+    JOIN contratos_locacao c ON c.id = p.contrato_id
+    LEFT JOIN imoveis i ON i.id = c.imovel_id
+    LEFT JOIN pessoas locatario ON locatario.id = c.locatario_id
+    WHERE p.repasse_id = $1
+    ORDER BY i.titulo, p.competencia
+  `, [req.params.id]);
+  const imobiliaria = await imobiliariaConfig();
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Demonstrativo de Repasse</title><style>body{font-family:Arial,sans-serif;margin:32px;color:#111}h1{text-align:center}table{width:100%;border-collapse:collapse;margin-top:16px}th,td{border:1px solid #ccc;padding:8px;text-align:left}.totals{margin-top:20px;text-align:right}.print{position:fixed;top:12px;right:12px}@media print{.print{display:none}}</style></head><body><button class="print" onclick="print()">Imprimir</button><h1>DEMONSTRATIVO DE REPASSE</h1><p><b>Imobiliaria:</b> ${escapeHtml(imobiliaria.nome || 'IGS Imobiliaria')}</p><p><b>Proprietario:</b> ${escapeHtml(row.proprietario_nome || '')} - ${escapeHtml(row.proprietario_doc || '')}</p><p><b>Competencia:</b> ${brDate(row.competencia)} | <b>Data:</b> ${brDate(row.repassado_em)}</p><table><thead><tr><th>Imovel</th><th>Contrato</th><th>Locatario</th><th>Competencia</th><th>Recebido</th></tr></thead><tbody>${parcelas.rows.map((p) => `<tr><td>${escapeHtml(p.imovel_titulo)}</td><td>${escapeHtml(p.contrato_codigo)}</td><td>${escapeHtml(p.locatario_nome)}</td><td>${brDate(p.competencia)}</td><td>${brl(p.valor_pago)}</td></tr>`).join('')}</tbody></table><div class="totals"><p>Valor bruto: <b>${brl(row.valor_bruto)}</b></p><p>Taxas/descontos: <b>${brl(Number(row.comissao || 0) + Number(row.descontos || 0))}</b></p><p>Valor liquido: <b>${brl(row.valor_liquido || row.valor_repasse)}</b></p><p>Forma: ${escapeHtml(row.forma_pagamento || '')}</p></div></body></html>`);
+});
+
+app.get('/api/reajustes', requireAuth, requirePermission('reajustes.read'), async (_req, res) => {
+  const result = await query(`
+    SELECT c.id contrato_id, c.codigo contrato, c.valor_aluguel, c.indice_reajuste, c.proximo_reajuste, c.inicio, c.fim,
+      i.titulo imovel, locatario.nome locatario,
+      COALESCE(r.status, CASE WHEN c.proximo_reajuste <= CURRENT_DATE THEN 'pendente' ELSE 'previsto' END) status
+    FROM contratos_locacao c
+    LEFT JOIN imoveis i ON i.id = c.imovel_id
+    LEFT JOIN pessoas locatario ON locatario.id = c.locatario_id
+    LEFT JOIN LATERAL (
+      SELECT status FROM contrato_reajustes cr WHERE cr.contrato_id = c.id ORDER BY cr.criado_em DESC LIMIT 1
+    ) r ON TRUE
+    WHERE c.status = 'ativo' AND c.proximo_reajuste <= CURRENT_DATE + INTERVAL '60 days'
+    ORDER BY c.proximo_reajuste ASC
+  `);
+  res.json(result.rows);
+});
+
+app.post('/api/reajustes/:contratoId/simular', requireAuth, requirePermission('reajustes.read'), async (req, res) => {
+  const contrato = await query('SELECT id, valor_aluguel FROM contratos_locacao WHERE id = $1', [req.params.contratoId]);
+  if (!contrato.rows[0]) return res.status(404).json({ error: 'Contrato nao encontrado.' });
+  const valorNovo = calculateAdjustedRent(contrato.rows[0].valor_aluguel, req.body.percentual);
+  const futuras = await query("SELECT COUNT(*)::int total FROM parcelas_aluguel WHERE contrato_id = $1 AND status IN ('aberta','parcial') AND competencia >= COALESCE($2::date, CURRENT_DATE)", [req.params.contratoId, req.body.data_base || null]);
+  res.json({ valor_anterior: contrato.rows[0].valor_aluguel, valor_novo: valorNovo, parcelas_futuras: futuras.rows[0].total });
+});
+
+app.post('/api/reajustes/:contratoId/aplicar', requireAuth, requirePermission('reajustes.write'), async (req, res) => {
+  const percentual = Number(req.body.percentual || 0);
+  if (!Number.isFinite(percentual)) return res.status(400).json({ error: 'Percentual invalido.' });
+  const response = await withTransaction(async (client) => {
+    const contrato = await client.query('SELECT * FROM contratos_locacao WHERE id = $1 FOR UPDATE', [req.params.contratoId]);
+    const current = contrato.rows[0];
+    if (!current) return null;
+    const dataBase = req.body.data_base || current.proximo_reajuste || new Date().toISOString().slice(0, 10);
+    const duplicate = await client.query("SELECT id FROM contrato_reajustes WHERE contrato_id = $1 AND data_base = $2::date AND status = 'aplicado'", [current.id, dataBase]);
+    if (duplicate.rows[0]) return { duplicate: true };
+    const valorNovo = calculateAdjustedRent(current.valor_aluguel, percentual);
+    const reajuste = await client.query(
+      `INSERT INTO contrato_reajustes (contrato_id, indice, percentual, valor_anterior, valor_novo, data_base, aplicado_em, usuario_id, observacao, status)
+       VALUES ($1, $2, $3, $4, $5, $6::date, now(), $7, $8, 'aplicado') RETURNING *`,
+      [current.id, req.body.indice || current.indice_reajuste, percentual, current.valor_aluguel, valorNovo, dataBase, req.session.user.id, req.body.observacao || null]
+    );
+    const updated = await client.query(
+      'UPDATE contratos_locacao SET valor_aluguel = $1, proximo_reajuste = $2::date WHERE id = $3 RETURNING *',
+      [valorNovo, req.body.proximo_reajuste || addMonthsIsoService(dataBase, 12), current.id]
+    );
+    const parcelas = await client.query(
+      `UPDATE parcelas_aluguel
+       SET valor = $1, valor_repasse = GREATEST($1 - (($1 * COALESCE($4::numeric, 0)) / 100), 0), reajuste_id = $2
+       WHERE contrato_id = $3 AND status IN ('aberta','parcial') AND competencia >= $5::date
+       RETURNING id`,
+      [valorNovo, reajuste.rows[0].id, current.id, current.taxa_administracao, dataBase]
+    );
+    await recordContractEvent(client, { contratoId: current.id, tipo: 'reajuste', descricao: `Reajuste de ${percentual}% aplicado`, before: current, after: updated.rows[0], usuarioId: req.session.user.id });
+    await logAction(req, 'aplicar_reajuste', 'contratos_locacao', current.id, { parcelas_afetadas: parcelas.rowCount, reajuste_id: reajuste.rows[0].id }, { client, before: current, after: updated.rows[0] });
+    return { contrato: updated.rows[0], reajuste: reajuste.rows[0], parcelas_afetadas: parcelas.rowCount };
+  });
+  if (!response) return res.status(404).json({ error: 'Contrato nao encontrado.' });
+  if (response.duplicate) return res.status(400).json({ error: 'Ja existe reajuste aplicado para esta data-base.' });
+  res.json(response);
+});
+
+app.post('/api/reajustes/:contratoId/adiar', requireAuth, requirePermission('reajustes.write'), async (req, res) => {
+  if (!req.body.nova_data) return res.status(400).json({ error: 'Informe a nova data.' });
+  const response = await withTransaction(async (client) => {
+    const contrato = await client.query('SELECT * FROM contratos_locacao WHERE id = $1 FOR UPDATE', [req.params.contratoId]);
+    const current = contrato.rows[0];
+    if (!current) return null;
+    const reajuste = await client.query(
+      `INSERT INTO contrato_reajustes (contrato_id, indice, data_base, usuario_id, observacao, status)
+       VALUES ($1, $2, COALESCE($3::date, CURRENT_DATE), $4, $5, 'adiado') RETURNING *`,
+      [current.id, current.indice_reajuste, current.proximo_reajuste || null, req.session.user.id, req.body.motivo || req.body.observacao || null]
+    );
+    const updated = await client.query('UPDATE contratos_locacao SET proximo_reajuste = $1::date WHERE id = $2 RETURNING *', [req.body.nova_data, current.id]);
+    await recordContractEvent(client, { contratoId: current.id, tipo: 'reajuste_adiado', descricao: req.body.motivo || 'Reajuste adiado', before: current, after: updated.rows[0], usuarioId: req.session.user.id });
+    await logAction(req, 'adiar_reajuste', 'contratos_locacao', current.id, { reajuste_id: reajuste.rows[0].id }, { client, before: current, after: updated.rows[0] });
+    return { contrato: updated.rows[0], reajuste: reajuste.rows[0] };
+  });
+  if (!response) return res.status(404).json({ error: 'Contrato nao encontrado.' });
+  res.json(response);
+});
+
+app.get('/api/contratos/:id/eventos', requireAuth, requirePermission('contratos.eventos.read'), async (req, res) => {
+  const result = await query(`
+    SELECT ce.*, u.nome usuario_nome
+    FROM contrato_eventos ce
+    LEFT JOIN usuarios u ON u.id = ce.usuario_id
+    WHERE ce.contrato_id = $1
+    ORDER BY ce.criado_em DESC
+  `, [req.params.id]);
+  res.json(result.rows);
+});
+
 app.get('/api/cep/:cep', requireAuth, requirePermission('cep.read'), async (req, res) => {
   const cep = String(req.params.cep || '').replace(/\D/g, '');
   if (cep.length !== 8) return res.status(400).json({ error: 'CEP invalido.' });
@@ -613,7 +1003,7 @@ const resources = {
   },
   contas_pagar: {
     table: 'contas_pagar',
-    fields: ['descricao', 'categoria', 'imovel_id', 'fornecedor_id', 'vencimento', 'valor', 'pago_em', 'status'],
+    fields: ['descricao', 'categoria', 'imovel_id', 'fornecedor_id', 'vencimento', 'valor', 'pago_em', 'descontar_repasse', 'status'],
     order: 'vencimento ASC',
   },
   leads: {
@@ -664,7 +1054,7 @@ for (const [name, config] of Object.entries(resources)) {
     if (codeConfig[name]) data.codigo = await nextSequentialCode(name);
     try {
       if (config.table === 'contratos_locacao') await fillContractRentFromProperty(data);
-      for (const field of ['disponivel_whatsapp', 'prazo_indeterminado', 'aluguel_garantido', 'cobrar_multa', 'repassar_multa', 'cobrar_juros', 'repassar_juros', 'cobrar_iptu', 'repassar_iptu', 'descontar_irrf', 'cobranca_eletronica']) {
+      for (const field of ['disponivel_whatsapp', 'prazo_indeterminado', 'aluguel_garantido', 'cobrar_multa', 'repassar_multa', 'cobrar_juros', 'repassar_juros', 'cobrar_iptu', 'repassar_iptu', 'descontar_irrf', 'cobranca_eletronica', 'descontar_repasse']) {
         if (field in data) data[field] = checkbox(data[field]);
       }
       if (config.table === 'imoveis' && !data.endereco) data.endereco = compactAddress(data) || data.titulo || 'Endereco nao informado';
@@ -690,7 +1080,7 @@ for (const [name, config] of Object.entries(resources)) {
     let result;
     try {
       if (config.table === 'contratos_locacao') await fillContractRentFromProperty(data);
-      for (const field of ['disponivel_whatsapp', 'prazo_indeterminado', 'aluguel_garantido', 'cobrar_multa', 'repassar_multa', 'cobrar_juros', 'repassar_juros', 'cobrar_iptu', 'repassar_iptu', 'descontar_irrf', 'cobranca_eletronica']) {
+      for (const field of ['disponivel_whatsapp', 'prazo_indeterminado', 'aluguel_garantido', 'cobrar_multa', 'repassar_multa', 'cobrar_juros', 'repassar_juros', 'cobrar_iptu', 'repassar_iptu', 'descontar_irrf', 'cobranca_eletronica', 'descontar_repasse']) {
         if (field in data) data[field] = checkbox(data[field]);
       }
       if (config.table === 'imoveis' && !data.endereco) data.endereco = compactAddress(data) || data.titulo || 'Endereco nao informado';

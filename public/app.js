@@ -10,11 +10,11 @@ const pageSize = 15;
 
 const rolePermissions = {
   ADMIN: ['*'],
-  FINANCEIRO: ['dashboard', 'faturas', 'relatorios', 'contas_receber', 'contas_pagar', 'pessoas', 'imoveis', 'contratos'],
-  CORRETOR: ['dashboard', 'pessoas', 'imoveis', 'contratos', 'leads', 'relatorios'],
-  ATENDIMENTO: ['dashboard', 'pessoas', 'imoveis', 'leads', 'chaves', 'relatorios'],
-  VISTORIADOR: ['dashboard', 'imoveis', 'relatorios'],
-  CONSULTA: ['dashboard', 'pessoas', 'imoveis', 'contratos', 'faturas', 'relatorios', 'leads', 'chaves', 'contas_receber', 'contas_pagar'],
+  FINANCEIRO: ['dashboard', 'operacional', 'inadimplencia', 'repasses', 'reajustes', 'faturas', 'relatorios', 'contas_receber', 'contas_pagar', 'pessoas', 'imoveis', 'contratos'],
+  CORRETOR: ['dashboard', 'operacional', 'inadimplencia', 'repasses', 'reajustes', 'pessoas', 'imoveis', 'contratos', 'leads', 'relatorios'],
+  ATENDIMENTO: ['dashboard', 'operacional', 'inadimplencia', 'repasses', 'reajustes', 'pessoas', 'imoveis', 'leads', 'chaves', 'relatorios'],
+  VISTORIADOR: ['dashboard', 'operacional', 'imoveis', 'relatorios'],
+  CONSULTA: ['dashboard', 'operacional', 'inadimplencia', 'repasses', 'reajustes', 'pessoas', 'imoveis', 'contratos', 'faturas', 'relatorios', 'leads', 'chaves', 'contas_receber', 'contas_pagar'],
 };
 
 function canView(view) {
@@ -283,6 +283,7 @@ const modules = {
       ['vencimento', 'Vencimento', 'date'],
       ['valor', 'Valor', 'number'],
       ['pago_em', 'Pago em', 'date'],
+      ['descontar_repasse', 'Descontar do repasse', 'checkbox'],
       ['status', 'Status', 'select', ['aberta', 'paga', 'cancelada']],
     ],
   },
@@ -418,6 +419,10 @@ function loginTemplate() {
 function shellTemplate() {
   const items = [
     ['dashboard', 'Dashboard'],
+    ['operacional', 'Operacao'],
+    ['inadimplencia', 'Inadimplencia'],
+    ['repasses', 'Repasses'],
+    ['reajustes', 'Reajustes'],
     ['pessoas', 'Clientes'],
     ['imoveis', 'Imoveis'],
     ['contratos', 'Locacoes'],
@@ -445,6 +450,9 @@ function shellTemplate() {
       <section class="workspace">
         <header class="quickbar">
           ${canView('pessoas') ? '<button data-view="pessoas">Pesquisar cliente</button>' : ''}
+          ${canView('operacional') ? '<button data-view="operacional">Central operacional</button>' : ''}
+          ${canView('inadimplencia') ? '<button data-view="inadimplencia">Inadimplencia</button>' : ''}
+          ${canView('repasses') ? '<button data-view="repasses">Repasses</button>' : ''}
           ${canView('imoveis') ? '<button data-view="imoveis">Pesquisar imovel</button>' : ''}
           ${canView('contratos') ? '<button data-view="contratos">Controle de contratos</button>' : ''}
           ${canView('faturas') ? '<button data-view="faturas">Faturas e repasses</button>' : ''}
@@ -505,6 +513,15 @@ async function loadView(view) {
   state.view = view;
   if (view === 'dashboard') {
     state.data.dashboard = await api('/api/dashboard');
+  } else if (view === 'operacional') {
+    state.data.operacional = await api('/api/operacional');
+  } else if (view === 'inadimplencia') {
+    const params = new URLSearchParams(state.filters.inadimplencia || {});
+    state.data.inadimplencia = await api(`/api/inadimplencia?${params}`);
+  } else if (view === 'repasses') {
+    state.data.repasses = await api('/api/repasses');
+  } else if (view === 'reajustes') {
+    state.data.reajustes = await api('/api/reajustes');
   } else if (view === 'faturas') {
     await loadDependencies();
     state.data.faturas = await api('/api/parcelas_aluguel');
@@ -561,6 +578,26 @@ function renderView() {
   if (state.view === 'relatorios') {
     content.innerHTML = reportsTemplate();
     bindReports();
+    return;
+  }
+  if (state.view === 'operacional') {
+    content.innerHTML = operationalTemplate();
+    bindOperational();
+    return;
+  }
+  if (state.view === 'inadimplencia') {
+    content.innerHTML = delinquencyTemplate();
+    bindDelinquency();
+    return;
+  }
+  if (state.view === 'repasses') {
+    content.innerHTML = transfersTemplate();
+    bindTransfers();
+    return;
+  }
+  if (state.view === 'reajustes') {
+    content.innerHTML = adjustmentsTemplate();
+    bindAdjustments();
     return;
   }
   content.innerHTML = moduleTemplate(state.view);
@@ -675,6 +712,104 @@ function dashboardTemplate(data) {
 
 function metric(label, value, className = '') {
   return `<div class="metric ${className}"><span>${label}</span><strong>${value}</strong></div>`;
+}
+
+function operationalTemplate() {
+  const data = state.data.operacional || { cards: {}, prioridades: [] };
+  const c = data.cards || {};
+  const cards = [
+    ['Alugueis atrasados', c.alugueisAtrasados?.total || 0, 'metric-danger'],
+    ['Valor em atraso', money.format(Number(c.alugueisAtrasados?.valor || 0)), 'metric-danger'],
+    ['Vencem hoje', c.alugueisHoje?.total || 0, 'metric-today'],
+    ['Valor hoje', money.format(Number(c.alugueisHoje?.valor || 0)), 'metric-today'],
+    ['Proximos 7 dias', c.alugueis7Dias?.total || 0, 'metric-warning'],
+    ['Valor 7 dias', money.format(Number(c.alugueis7Dias?.valor || 0)), 'metric-warning'],
+    ['Recebidos hoje', c.recebidosHoje?.total || 0, 'metric-success'],
+    ['Valor recebido', money.format(Number(c.recebidosHoje?.valor || 0)), 'metric-success'],
+    ['Repasses pendentes', c.repassesPendentes?.total || 0, 'metric-info'],
+    ['Valor a repassar', money.format(Number(c.repassesPendentes?.valor || 0)), 'metric-info'],
+    ['Proprietarios aguardando', c.repassesPendentes?.proprietarios || 0, 'metric-info'],
+    ['Reajustes pendentes', c.contratosReajustePendente || 0, 'metric-warning'],
+    ['Contratos vencem 30d', c.contratosVencendo30 || 0, 'metric-warning'],
+    ['Contratos vencem 60d', c.contratosVencendo60 || 0, 'metric-dark'],
+    ['Chaves fora', c.chavesNaoDevolvidas || 0, 'metric-danger'],
+  ];
+  return `
+    <div class="topbar"><div><h1>Central Operacional</h1><p>Trabalho por excecao: cobrancas, repasses, reajustes, contratos e chaves.</p></div><button class="secondary" id="refresh-operational">Atualizar</button></div>
+    <section class="grid metrics">${cards.map(([label, value, cls]) => metric(label, value, cls)).join('')}</section>
+    <section class="panel"><h2>Acoes prioritarias</h2><div class="alert-list">
+      ${(data.prioridades || []).length ? data.prioridades.map((item) => `<div class="alert-item status-atrasada"><div><strong>${escapeHtml(item.titulo)}</strong><span>Contrato ${escapeHtml(item.contrato)} | ${escapeHtml(item.locatario || '-')} | ${escapeHtml(item.imovel || '-')}</span></div><div class="alert-meta"><b>${money.format(Number(item.saldo || 0))}</b><button class="secondary" data-view="inadimplencia">Ver cobranca</button></div></div>`).join('') : '<p>Nenhuma prioridade critica no momento.</p>'}
+    </div></section>
+  `;
+}
+
+function bindOperational() {
+  document.querySelector('#refresh-operational')?.addEventListener('click', () => loadView('operacional'));
+  document.querySelectorAll('[data-view]').forEach((button) => button.addEventListener('click', () => loadView(button.dataset.view)));
+}
+
+function delinquencyTemplate() {
+  const rows = state.data.inadimplencia || [];
+  const pageRows = paginatedRows('inadimplencia', rows);
+  return `
+    <div class="topbar"><div><h1>Central de Inadimplencia</h1><p>Faturas abertas/parciais vencidas, sem canceladas e sem pagas.</p></div></div>
+    <div class="filter-panel report-filters">
+      <label>Busca<input id="delinquency-search" value="${escapeHtml(state.filters.inadimplencia?.busca || '')}" placeholder="Locatario, imovel ou contrato"></label>
+      <label>Atraso min.<input id="delinquency-min" type="number" value="${escapeHtml(state.filters.inadimplencia?.atraso_min || '')}"></label>
+      <label>Ordenar<select id="delinquency-order"><option value="maior_atraso">Maior atraso</option><option value="maior_divida">Maior divida</option><option value="vencimento">Vencimento</option><option value="nome">Nome</option></select></label>
+      <button class="primary" id="run-delinquency">Filtrar</button>
+    </div>
+    <div class="table-wrap"><table><thead><tr><th>Contrato</th><th>Locatario</th><th>Imovel</th><th>Vencimento</th><th>Dias</th><th>Saldo atualizado</th><th>Situacao</th><th>Ultima acao</th><th>Acoes</th></tr></thead><tbody>
+      ${pageRows.length ? pageRows.map((row) => `<tr><td>${escapeHtml(row.contrato_codigo)}</td><td>${escapeHtml(row.locatario_nome)}</td><td>${escapeHtml(row.imovel_titulo)}</td><td>${date(row.vencimento)}</td><td>${row.encargos.dias_atraso}</td><td><b>${money.format(Number(row.encargos.saldo_atualizado || 0))}</b></td><td><span class="tag status-atrasada">${escapeHtml(row.encargos.situacao)}</span></td><td>${escapeHtml(row.ultima_acao_status || '-')}</td><td class="row-actions"><button class="secondary" data-charge="${row.id}">Registrar contato</button><button class="secondary" data-negotiate="${row.id}">Negociar</button><button class="secondary" data-whatsapp="${row.id}">WhatsApp</button><button class="secondary" data-pay="${row.id}">Receber</button></td></tr>`).join('') : '<tr><td colspan="9">Nenhuma inadimplencia encontrada.</td></tr>'}
+    </tbody></table>${paginationTemplate('inadimplencia', rows.length)}</div>
+  `;
+}
+
+function bindDelinquency() {
+  const order = document.querySelector('#delinquency-order');
+  if (order) order.value = state.filters.inadimplencia?.ordem || 'maior_atraso';
+  document.querySelector('#run-delinquency').addEventListener('click', async () => {
+    state.filters.inadimplencia = {
+      busca: document.querySelector('#delinquency-search').value,
+      atraso_min: document.querySelector('#delinquency-min').value,
+      ordem: document.querySelector('#delinquency-order').value,
+    };
+    state.pages.inadimplencia = 1;
+    await loadView('inadimplencia');
+  });
+  bindPagination('inadimplencia');
+  document.querySelectorAll('[data-charge]').forEach((button) => button.addEventListener('click', () => openChargeActionForm(button.dataset.charge)));
+  document.querySelectorAll('[data-negotiate]').forEach((button) => button.addEventListener('click', () => openNegotiateForm(button.dataset.negotiate)));
+  document.querySelectorAll('[data-whatsapp]').forEach((button) => button.addEventListener('click', () => openWhatsapp(button.dataset.whatsapp)));
+  document.querySelectorAll('[data-pay]').forEach((button) => button.addEventListener('click', () => openInvoicePayForm(button.dataset.pay)));
+}
+
+function transfersTemplate() {
+  const rows = state.data.repasses || [];
+  return `
+    <div class="topbar"><div><h1>Central de Repasses</h1><p>Recebimentos de locatarios ainda nao repassados aos proprietarios.</p></div></div>
+    <div class="table-wrap"><table><thead><tr><th>Proprietario</th><th>Imoveis</th><th>Recebido</th><th>Taxas</th><th>Despesas</th><th>A repassar</th><th>Acoes</th></tr></thead><tbody>
+      ${rows.length ? rows.map((row) => `<tr><td>${escapeHtml(row.nome)}</td><td>${row.imoveis}</td><td>${money.format(Number(row.recebido || 0))}</td><td>${money.format(Number(row.taxa || 0))}</td><td>${money.format(Number(row.despesas || 0))}</td><td><b>${money.format(Number(row.liquido || 0))}</b></td><td class="row-actions"><button class="secondary" data-transfer-detail="${row.id}">Ver composicao</button><button class="primary" data-transfer-pay="${row.id}">Marcar repasse</button></td></tr>`).join('') : '<tr><td colspan="7">Nenhum repasse pendente.</td></tr>'}
+    </tbody></table></div>`;
+}
+
+function bindTransfers() {
+  document.querySelectorAll('[data-transfer-detail]').forEach((button) => button.addEventListener('click', () => openTransferComposition(button.dataset.transferDetail)));
+  document.querySelectorAll('[data-transfer-pay]').forEach((button) => button.addEventListener('click', () => markTransfer(button.dataset.transferPay)));
+}
+
+function adjustmentsTemplate() {
+  const rows = state.data.reajustes || [];
+  return `
+    <div class="topbar"><div><h1>Reajustes</h1><p>Contratos ativos com reajuste pendente ou previsto nos proximos 60 dias.</p></div></div>
+    <div class="table-wrap"><table><thead><tr><th>Contrato</th><th>Imovel</th><th>Locatario</th><th>Valor atual</th><th>Indice</th><th>Proximo reajuste</th><th>Status</th><th>Acoes</th></tr></thead><tbody>
+      ${rows.length ? rows.map((row) => `<tr><td>${escapeHtml(row.contrato)}</td><td>${escapeHtml(row.imovel)}</td><td>${escapeHtml(row.locatario)}</td><td>${money.format(Number(row.valor_aluguel || 0))}</td><td>${escapeHtml(row.indice_reajuste || '-')}</td><td>${date(row.proximo_reajuste)}</td><td><span class="tag status-${row.status}">${escapeHtml(labelize(row.status))}</span></td><td class="row-actions"><button class="secondary" data-adjust="${row.contrato_id}">Simular/aplicar</button><button class="secondary" data-postpone="${row.contrato_id}">Adiar</button></td></tr>`).join('') : '<tr><td colspan="8">Nenhum reajuste previsto.</td></tr>'}
+    </tbody></table></div>`;
+}
+
+function bindAdjustments() {
+  document.querySelectorAll('[data-adjust]').forEach((button) => button.addEventListener('click', () => openAdjustmentForm(button.dataset.adjust)));
+  document.querySelectorAll('[data-postpone]').forEach((button) => button.addEventListener('click', () => postponeAdjustment(button.dataset.postpone)));
 }
 
 function alertRow(row) {
@@ -1202,6 +1337,7 @@ function openInvoicePayForm(id) {
   modal.querySelector('#pay-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     await submitModalRequest(modal, `/api/parcelas_aluguel/${id}/baixar`, 'PUT');
+    if (state.view === 'inadimplencia') await loadView('inadimplencia');
   });
 }
 
@@ -1295,6 +1431,118 @@ function openLooseInvoiceForm() {
   });
 }
 
+function openChargeActionForm(id) {
+  const modal = document.createElement('div');
+  modal.className = 'modal-backdrop';
+  modal.innerHTML = `
+    <form class="modal compact-modal" id="charge-form">
+      <header><div><h2>Registrar acao de cobranca</h2><p>Historico operacional da inadimplencia.</p></div><button type="button" class="secondary" data-close>Fechar</button></header>
+      <div class="form-grid">
+        <label>Tipo<select name="tipo"><option value="whatsapp">WhatsApp</option><option value="telefone">Telefone</option><option value="email">E-mail</option><option value="presencial">Presencial</option><option value="acordo">Acordo</option><option value="juridico">Juridico</option><option value="observacao">Observacao</option></select></label>
+        <label>Status<select name="status"><option value="enviado">Enviado</option><option value="sem_resposta">Sem resposta</option><option value="prometeu_pagar">Prometeu pagar</option><option value="pago">Pago</option><option value="negociacao">Negociacao</option><option value="encaminhado_juridico">Encaminhado juridico</option></select></label>
+        <label>Proxima acao<input name="proxima_acao_em" type="datetime-local"></label>
+        <label class="full">Observacao<textarea name="observacao"></textarea></label>
+      </div>
+      <div class="actions"><button type="button" class="secondary" data-close>Cancelar</button><button class="primary" type="submit">Salvar</button></div><div class="error" id="form-error"></div>
+    </form>`;
+  document.body.appendChild(modal);
+  modal.querySelectorAll('[data-close]').forEach((button) => button.addEventListener('click', () => modal.remove()));
+  modal.querySelector('#charge-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    await submitModalRequest(modal, `/api/inadimplencia/${id}/acao`, 'POST');
+    await loadView('inadimplencia');
+  });
+}
+
+function openNegotiateForm(id) {
+  const modal = document.createElement('div');
+  modal.className = 'modal-backdrop';
+  modal.innerHTML = `
+    <form class="modal compact-modal" id="negotiate-form">
+      <header><div><h2>Negociar fatura</h2><p>Registra acordo sem apagar valores anteriores.</p></div><button type="button" class="secondary" data-close>Fechar</button></header>
+      <div class="form-grid">
+        <label>Desconto<input name="desconto" type="number" min="0" step="0.01" value="0"></label>
+        <label>Nova data<input name="nova_data" type="date"></label>
+        <label>Proxima acao<input name="proxima_acao_em" type="datetime-local"></label>
+        <label class="full">Motivo<input name="motivo" type="text"></label>
+        <label class="full">Observacao<textarea name="observacao"></textarea></label>
+      </div>
+      <div class="actions"><button type="button" class="secondary" data-close>Cancelar</button><button class="primary" type="submit">Salvar negociacao</button></div><div class="error" id="form-error"></div>
+    </form>`;
+  document.body.appendChild(modal);
+  modal.querySelectorAll('[data-close]').forEach((button) => button.addEventListener('click', () => modal.remove()));
+  modal.querySelector('#negotiate-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    await submitModalRequest(modal, `/api/inadimplencia/${id}/negociar`, 'POST');
+    await loadView('inadimplencia');
+  });
+}
+
+async function openWhatsapp(id) {
+  const data = await api(`/api/inadimplencia/${id}/whatsapp`);
+  if (data.url) window.open(data.url, '_blank');
+  else alert(data.message || 'Locatario sem WhatsApp/telefone cadastrado.');
+}
+
+async function openTransferComposition(id) {
+  const data = await api(`/api/repasses/${id}/composicao`);
+  const modal = document.createElement('div');
+  modal.className = 'modal-backdrop';
+  modal.innerHTML = `
+    <div class="modal">
+      <header><div><h2>Composicao do repasse</h2><p>${data.parcelas.length} fatura(s), ${data.despesas.length} despesa(s)</p></div><button type="button" class="secondary" data-close>Fechar</button></header>
+      <div class="table-wrap"><table><thead><tr><th>Contrato</th><th>Imovel</th><th>Competencia</th><th>Recebido</th><th>Taxa adm.</th><th>Liquido</th></tr></thead><tbody>${data.parcelas.map((p) => `<tr><td>${escapeHtml(p.contrato_codigo)}</td><td>${escapeHtml(p.imovel_titulo)}</td><td>${date(p.competencia)}</td><td>${money.format(Number(p.valor_pago || 0))}</td><td>${money.format(Number(p.totais_repasse.taxa_administracao || 0))}</td><td>${money.format(Number(p.totais_repasse.liquido || 0))}</td></tr>`).join('')}</tbody></table></div>
+      <section class="grid metrics report-summary">${metric('Recebido', money.format(Number(data.totals.recebido || 0)))}${metric('Taxas', money.format(Number(data.totals.taxa || 0)))}${metric('Despesas', money.format(Number(data.totals.despesas || 0)))}${metric('Liquido', money.format(Number(data.totals.liquido || 0)))}</section>
+    </div>`;
+  document.body.appendChild(modal);
+  modal.querySelectorAll('[data-close]').forEach((button) => button.addEventListener('click', () => modal.remove()));
+}
+
+async function markTransfer(id) {
+  if (!confirm('Confirmar repasse? Esta acao marca parcelas e despesas como repassadas.')) return;
+  const result = await api(`/api/repasses/${id}/marcar`, { method: 'POST', body: JSON.stringify({ forma_pagamento: 'PIX' }) });
+  window.open(`/api/repasses/${result.id}/demonstrativo`, '_blank');
+  await loadView('repasses');
+}
+
+function openAdjustmentForm(id) {
+  const modal = document.createElement('div');
+  modal.className = 'modal-backdrop';
+  modal.innerHTML = `
+    <form class="modal compact-modal" id="adjustment-form">
+      <header><div><h2>Aplicar reajuste</h2><p>Informe o percentual manualmente. Parcelas pagas/canceladas nao serao alteradas.</p></div><button type="button" class="secondary" data-close>Fechar</button></header>
+      <div class="form-grid">
+        <label>Percentual %<input name="percentual" type="number" step="0.0001" required></label>
+        <label>Data-base<input name="data_base" type="date" value="${todayInputValue()}"></label>
+        <label>Proximo reajuste<input name="proximo_reajuste" type="date"></label>
+        <label class="full">Observacao<textarea name="observacao"></textarea></label>
+      </div>
+      <div class="actions"><button type="button" class="secondary" id="simulate-adjustment">Simular</button><button class="primary" type="submit">Aplicar</button></div><div class="error" id="form-error"></div>
+      <div id="adjustment-preview"></div>
+    </form>`;
+  document.body.appendChild(modal);
+  modal.querySelectorAll('[data-close]').forEach((button) => button.addEventListener('click', () => modal.remove()));
+  modal.querySelector('#simulate-adjustment').addEventListener('click', async () => {
+    const payload = Object.fromEntries(new FormData(modal.querySelector('form')).entries());
+    const preview = await api(`/api/reajustes/${id}/simular`, { method: 'POST', body: JSON.stringify(payload) });
+    modal.querySelector('#adjustment-preview').innerHTML = `<p>Valor novo: <b>${money.format(Number(preview.valor_novo || 0))}</b> | Parcelas futuras afetadas: <b>${preview.parcelas_futuras}</b></p>`;
+  });
+  modal.querySelector('#adjustment-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!confirm('Confirmar aplicacao do reajuste?')) return;
+    await submitModalRequest(modal, `/api/reajustes/${id}/aplicar`, 'POST');
+    await loadView('reajustes');
+  });
+}
+
+async function postponeAdjustment(id) {
+  const nova_data = prompt('Nova data do reajuste (AAAA-MM-DD):');
+  if (!nova_data) return;
+  const motivo = prompt('Motivo do adiamento:') || '';
+  await api(`/api/reajustes/${id}/adiar`, { method: 'POST', body: JSON.stringify({ nova_data, motivo }) });
+  await loadView('reajustes');
+}
+
 async function submitModalForm(modal, endpoint) {
   await submitModalRequest(modal, endpoint, 'POST');
 }
@@ -1308,7 +1556,7 @@ async function submitModalRequest(modal, endpoint, method) {
   try {
     await api(endpoint, { method, body: JSON.stringify(payload) });
     modal.remove();
-    state.data.faturas = await api('/api/parcelas_aluguel');
+    if (state.view === 'faturas') state.data.faturas = await api('/api/parcelas_aluguel');
     render();
   } catch (error) {
     modal.querySelector('#form-error').textContent = error.message;

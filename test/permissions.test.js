@@ -17,6 +17,13 @@ test('FINANCEIRO can manage payments', () => {
   assert.equal(can({ perfil: 'FINANCEIRO' }, 'leads.write'), false);
 });
 
+test('new operation permissions protect transfers and collections', () => {
+  assert.equal(can({ perfil: 'FINANCEIRO' }, 'repasses.write'), true);
+  assert.equal(can({ perfil: 'ATENDIMENTO' }, 'inadimplencia.write'), true);
+  assert.equal(can({ perfil: 'ATENDIMENTO' }, 'repasses.write'), false);
+  assert.equal(can({ perfil: 'CONSULTA' }, 'repasses.write'), false);
+});
+
 test('roles are normalized to uppercase', () => {
   assert.equal(normalizeRole('financeiro'), 'FINANCEIRO');
   assert.equal(normalizeRole(null), 'CONSULTA');

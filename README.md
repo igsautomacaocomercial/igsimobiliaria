@@ -19,6 +19,10 @@ V1 funcional de um sistema imobiliario inspirado em ERP de locacao, CRM/site de 
 - CRM de leads e funil
 - Backup JSON das tabelas principais
 - Relatorios de auditoria: carteira por bairro, imoveis sem proprietario, dados incompletos e chaves em aberto
+- Central Operacional do dia com inadimplencia, repasses, reajustes, contratos vencendo e chaves abertas
+- Central de Inadimplencia com calculo de multa/juros, historico de cobranca, negociacao e link de WhatsApp
+- Central de Repasses com composicao por proprietario, despesas descontaveis e demonstrativo imprimivel
+- Reajustes de contratos com simulacao manual, aplicacao transacional e historico de eventos
 
 ## Rodar com PostgreSQL via Docker
 
@@ -72,6 +76,10 @@ O schema fica em `src/schema.sql` e cobre as tabelas principais:
 - `configuracoes`
 - `logs_sistema`
 - `emprestimos_chaves`
+- `cobrancas_historico`
+- `acordos_cobranca`
+- `contrato_reajustes`
+- `contrato_eventos`
 
 ## Evolucao sugerida
 
@@ -79,6 +87,6 @@ O schema fica em `src/schema.sql` e cobre as tabelas principais:
 - V3: boletos/contas automaticas de aluguel
 - V4: repasse de proprietario
 - V5: vistoria com fotos
-- V6: WhatsApp e avisos automaticos
-- V7: relatorios PRO com exportacao CSV/PDF e filtros salvos por usuario
+- V6: WhatsApp e avisos automaticos com integracao externa
+- V7: relatorios PRO com exportacao PDF e filtros salvos por usuario
 - V8: site/catalogo publico de imoveis

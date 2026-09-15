@@ -196,7 +196,8 @@ CREATE TABLE IF NOT EXISTS logs_sistema (
 INSERT INTO configuracoes (chave, valor)
 VALUES
   ('imobiliaria', '{"nome":"IGS Imobiliaria","email":"","telefone":"","cidade":""}'::jsonb),
-  ('financeiro', '{"multa_percentual":2,"juros_mensal_percentual":1,"comissao_percentual":10}'::jsonb)
+  ('financeiro', '{"multa_percentual":2,"juros_mensal_percentual":1,"comissao_percentual":10}'::jsonb),
+  ('cobranca_whatsapp', '{"modelo":"Olá, [NOME].\n\nIdentificamos que a parcela do contrato [CONTRATO], referente ao imóvel [IMOVEL], com vencimento em [DATA], encontra-se pendente.\n\nSaldo atual: [VALOR].\n\nPor favor, entre em contato conosco para regularização.\n\nAtenciosamente,\n[NOME_IMOBILIARIA]"}'::jsonb)
 ON CONFLICT (chave) DO NOTHING;
 
 ALTER TABLE pessoas
@@ -317,7 +318,9 @@ ALTER TABLE parcelas_aluguel
   ADD COLUMN IF NOT EXISTS documento_personalizado_em TIMESTAMPTZ,
   ADD COLUMN IF NOT EXISTS cancelado_em TIMESTAMPTZ,
   ADD COLUMN IF NOT EXISTS cancelado_por UUID REFERENCES usuarios(id) ON DELETE SET NULL,
-  ADD COLUMN IF NOT EXISTS motivo_cancelamento TEXT;
+  ADD COLUMN IF NOT EXISTS motivo_cancelamento TEXT,
+  ADD COLUMN IF NOT EXISTS repasse_id UUID,
+  ADD COLUMN IF NOT EXISTS reajuste_id UUID;
 
 CREATE TABLE IF NOT EXISTS pagamentos_parcela (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -358,7 +361,10 @@ ALTER TABLE logs_sistema
 ALTER TABLE contas_pagar
   ADD COLUMN IF NOT EXISTS cancelado_em TIMESTAMPTZ,
   ADD COLUMN IF NOT EXISTS cancelado_por UUID REFERENCES usuarios(id) ON DELETE SET NULL,
-  ADD COLUMN IF NOT EXISTS motivo_cancelamento TEXT;
+  ADD COLUMN IF NOT EXISTS motivo_cancelamento TEXT,
+  ADD COLUMN IF NOT EXISTS descontar_repasse BOOLEAN NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS descontado_repasse_em TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS repasse_id UUID;
 
 ALTER TABLE contas_receber
   ADD COLUMN IF NOT EXISTS cancelado_em TIMESTAMPTZ,
@@ -391,3 +397,72 @@ CREATE INDEX IF NOT EXISTS imoveis_proprietario_idx ON imoveis (proprietario_id)
 CREATE INDEX IF NOT EXISTS leads_etapa_idx ON leads (etapa);
 CREATE INDEX IF NOT EXISTS emprestimos_chaves_devolvida_idx ON emprestimos_chaves (devolvida_em);
 CREATE INDEX IF NOT EXISTS logs_sistema_criado_idx ON logs_sistema (criado_em);
+
+CREATE TABLE IF NOT EXISTS cobrancas_historico (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  parcela_id UUID NOT NULL REFERENCES parcelas_aluguel(id) ON DELETE RESTRICT,
+  contrato_id UUID REFERENCES contratos_locacao(id) ON DELETE SET NULL,
+  locatario_id UUID REFERENCES pessoas(id) ON DELETE SET NULL,
+  usuario_id UUID REFERENCES usuarios(id) ON DELETE SET NULL,
+  tipo TEXT NOT NULL,
+  status TEXT NOT NULL,
+  observacao TEXT,
+  proxima_acao_em TIMESTAMPTZ,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS acordos_cobranca (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  parcela_id UUID NOT NULL REFERENCES parcelas_aluguel(id) ON DELETE RESTRICT,
+  usuario_id UUID REFERENCES usuarios(id) ON DELETE SET NULL,
+  desconto NUMERIC(12,2) NOT NULL DEFAULT 0,
+  nova_data DATE,
+  motivo TEXT,
+  observacao TEXT,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE repasses_proprietario
+  ADD COLUMN IF NOT EXISTS forma_pagamento TEXT,
+  ADD COLUMN IF NOT EXISTS observacao TEXT,
+  ADD COLUMN IF NOT EXISTS usuario_id UUID REFERENCES usuarios(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS descontos NUMERIC(12,2) NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS taxa_administracao_total NUMERIC(12,2) NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS valor_liquido NUMERIC(12,2) DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS contrato_reajustes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  contrato_id UUID NOT NULL REFERENCES contratos_locacao(id) ON DELETE RESTRICT,
+  indice TEXT,
+  percentual NUMERIC(9,4),
+  valor_anterior NUMERIC(12,2),
+  valor_novo NUMERIC(12,2),
+  data_base DATE NOT NULL,
+  aplicado_em TIMESTAMPTZ,
+  usuario_id UUID REFERENCES usuarios(id) ON DELETE SET NULL,
+  observacao TEXT,
+  status TEXT NOT NULL DEFAULT 'previsto',
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS contrato_reajustes_aplicado_unico_idx
+  ON contrato_reajustes (contrato_id, data_base)
+  WHERE status = 'aplicado';
+
+CREATE TABLE IF NOT EXISTS contrato_eventos (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  contrato_id UUID NOT NULL REFERENCES contratos_locacao(id) ON DELETE CASCADE,
+  tipo TEXT NOT NULL,
+  descricao TEXT,
+  dados_anteriores JSONB,
+  dados_novos JSONB,
+  usuario_id UUID REFERENCES usuarios(id) ON DELETE SET NULL,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS cobrancas_parcela_idx ON cobrancas_historico (parcela_id, criado_em DESC);
+CREATE INDEX IF NOT EXISTS cobrancas_proxima_acao_idx ON cobrancas_historico (proxima_acao_em);
+CREATE INDEX IF NOT EXISTS parcelas_repasse_idx ON parcelas_aluguel (repasse_id);
+CREATE INDEX IF NOT EXISTS contas_pagar_repasse_idx ON contas_pagar (repasse_id);
+CREATE INDEX IF NOT EXISTS contrato_reajustes_contrato_idx ON contrato_reajustes (contrato_id, data_base);
+CREATE INDEX IF NOT EXISTS contrato_eventos_contrato_idx ON contrato_eventos (contrato_id, criado_em DESC);
